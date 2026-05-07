@@ -129,19 +129,37 @@ async def handle_chat_msg(message: Message, bot: Bot, state: FSMContext):
         f"<a href='{anon_link}'>✉️ Написать анонимно</a>"
     )
 
+    # Аватарка: берём фото профиля из бота (загруженное при регистрации)
+    avatar_id = user["avatar_id"] if user else None
+
     try:
         if message.text:
-            await bot.send_message(
-                CHAT_GROUP_ID, header + message.text + footer, parse_mode="HTML"
-            )
+            msg_text = header + message.text + footer
+            if avatar_id:
+                await bot.send_photo(CHAT_GROUP_ID, avatar_id, caption=msg_text, parse_mode="HTML")
+            else:
+                await bot.send_message(CHAT_GROUP_ID, msg_text, parse_mode="HTML")
         elif message.photo:
             cap = header + (message.caption or "") + footer
-            await bot.send_photo(CHAT_GROUP_ID, message.photo[-1].file_id, caption=cap, parse_mode="HTML")
+            if avatar_id:
+                # Сначала аватарка с подписью, потом само фото
+                await bot.send_photo(CHAT_GROUP_ID, avatar_id, caption=cap, parse_mode="HTML")
+                await bot.send_photo(CHAT_GROUP_ID, message.photo[-1].file_id)
+            else:
+                await bot.send_photo(CHAT_GROUP_ID, message.photo[-1].file_id, caption=cap, parse_mode="HTML")
         elif message.video:
             cap = header + (message.caption or "") + footer
-            await bot.send_video(CHAT_GROUP_ID, message.video.file_id, caption=cap, parse_mode="HTML")
+            if avatar_id:
+                await bot.send_photo(CHAT_GROUP_ID, avatar_id, caption=cap, parse_mode="HTML")
+                await bot.send_video(CHAT_GROUP_ID, message.video.file_id)
+            else:
+                await bot.send_video(CHAT_GROUP_ID, message.video.file_id, caption=cap, parse_mode="HTML")
         elif message.sticker:
-            await bot.send_message(CHAT_GROUP_ID, header + "🎭 Стикер" + footer, parse_mode="HTML")
+            msg_text = header + "🎭 Стикер" + footer
+            if avatar_id:
+                await bot.send_photo(CHAT_GROUP_ID, avatar_id, caption=msg_text, parse_mode="HTML")
+            else:
+                await bot.send_message(CHAT_GROUP_ID, msg_text, parse_mode="HTML")
             await bot.send_sticker(CHAT_GROUP_ID, message.sticker.file_id)
 
         await db.update_last_chat(uid)
