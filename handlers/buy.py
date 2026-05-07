@@ -1,17 +1,35 @@
 from aiogram import Router, F, Bot
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 import database as db
 from config import DA_LINK, BOT_COMMISSION, ADMIN_ID
-from da_checker import check_donation, get_donation_amount_by_comment
-from keyboards.inline import kb_main_menu, kb_back, kb_order_chat
+from da_checker import get_donation_amount_by_comment
+from keyboards.inline import kb_order_chat, kb_main_menu
 
 router = Router()
 
 class BuyFSM(StatesGroup):
     waiting_payment = State()
+
+def kb_insufficient(product_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")],
+        [InlineKeyboardButton(text="◀️ Назад",            callback_data=f"product_{product_id}")]
+    ])
+
+def kb_pay_da(order_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data=f"check_payment_{order_id}")],
+        [InlineKeyboardButton(text="❌ Отмена",                callback_data="market")]
+    ])
+
+def kb_not_paid(order_id: int, da_comment: str, amount: float):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить снова", callback_data=f"check_payment_{order_id}")],
+        [InlineKeyboardButton(text="❌ Отмена",           callback_data="market")]
+    ])
 
 @router.callback_query(F.data.startswith("buy_"))
 async def start_buy(call: CallbackQuery, state: FSMContext, bot: Bot):
@@ -25,79 +43,32 @@ async def start_buy(call: CallbackQuery, state: FSMContext, bot: Bot):
         await call.answer("❌ Нельзя купить свой товар.", show_alert=True)
         return
 
-    buyer = await db.get_user(call.from_user.id)
-    commission = round(product["price"] * BOT_COMMISSION, 2)
-    seller_gets = round(product["price"] - commission, 2)
-    da_comment = f"Заказ {call.from_user.id}"
+    price      = product["price"]
+    commission = round(price * BOT_COMMISSION, 2)
+    seller_gets = round(price - commission, 2)
+    balance    = await db.get_balance(call.from_user.id)
 
-    # Создаём заказ в статусе pending_payment
-    order_id = await db.create_order(
-        call.from_user.id, product["seller_id"],
-        product_id, product["price"], commission, da_comment
-    )
-    await db.update_order_status(order_id, "pending_payment")
-
-    await state.update_data(order_id=order_id, amount=product["price"], da_comment=da_comment)
-    await state.set_state(BuyFSM.waiting_payment)
-
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил — проверить", callback_data=f"check_payment_{order_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="market")]
-    ])
-
-    text = (
-        f"💳 <b>Оплата заказа #{order_id}</b>\n\n"
-        f"📦 {product['title']}\n"
-        f"💰 Сумма: <b>{product['price']:.0f} ₽</b>\n\n"
-        f"<b>Как оплатить:</b>\n"
-        f"1️⃣ Перейди на DonationAlerts:\n👉 {DA_LINK}\n\n"
-        f"2️⃣ В поле «Сообщение» напиши точно:\n"
-        f"<code>{da_comment}</code>\n\n"
-        f"3️⃣ Сумма доната: <b>{product['price']:.0f} ₽</b>\n\n"
-        f"4️⃣ После оплаты нажми кнопку ниже 👇"
-    )
-    try:
-        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    except Exception:
-        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-@router.callback_query(F.data.startswith("check_payment_"))
-async def check_payment(call: CallbackQuery, state: FSMContext, bot: Bot):
-    order_id = int(call.data.split("_")[2])
-    order = await db.get_order(order_id)
-
-    if not order or order["buyer_id"] != call.from_user.id:
-        await call.answer("Заказ не найден.", show_alert=True)
-        return
-
-    # Если токен DA не настроен — честно говорим
-    from config import DA_TOKEN
-    if not DA_TOKEN:
-        await call.answer("⚠️ Автопроверка недоступна — токен DA не настроен.", show_alert=True)
-        return
-
-    await call.answer("⏳ Проверяем оплату...", show_alert=False)
-
-    product = await db.get_product(order["product_id"])
-    found = await get_donation_amount_by_comment(order["da_comment"], order["amount"])
-
-    if found > 0:
-        # ✅ Оплата подтверждена — зачисляем автоматически
+    # ── Достаточно средств на балансе — платим с баланса ──
+    if balance >= price:
+        await db.change_balance(call.from_user.id, -price)
+        order_id = await db.create_order(
+            call.from_user.id, product["seller_id"],
+            product_id, price, commission, ""
+        )
         await db.update_order_status(order_id, "paid")
-        seller_gets = round(order["amount"] - order["commission"], 2)
-        await state.clear()
 
         await call.message.edit_text(
-            f"✅ <b>Оплата подтверждена!</b>\n\n"
-            f"Заказ #{order_id} активен.\n"
-            f"Переписка с продавцом открыта — жди товар 👇",
+            f"✅ <b>Оплачено с баланса!</b>\n\n"
+            f"📦 {product['title']}\n"
+            f"💰 Списано: <b>{price:.0f} ₽</b>\n"
+            f"💳 Остаток: <b>{balance - price:.0f} ₽</b>\n\n"
+            f"Переписка с продавцом открыта 👇",
             parse_mode="HTML",
             reply_markup=kb_order_chat(order_id, "buyer")
         )
         await bot.send_message(
-            order["seller_id"],
-            f"🔔 <b>Новый оплаченный заказ #{order_id}!</b>\n\n"
+            product["seller_id"],
+            f"🔔 <b>Новый заказ #{order_id}!</b>\n\n"
             f"📦 {product['title']}\n"
             f"💰 Ты получишь: <b>{seller_gets:.0f} ₽</b>\n\n"
             f"Отправь товар покупателю и подтверди выдачу 👇",
@@ -105,22 +76,131 @@ async def check_payment(call: CallbackQuery, state: FSMContext, bot: Bot):
             reply_markup=kb_order_chat(order_id, "seller")
         )
         await bot.send_message(ADMIN_ID,
-            f"✅ Заказ #{order_id} оплачен\nПокупатель: {call.from_user.id}\n"
-            f"Продавец: {order['seller_id']}\nСумма: {order['amount']:.0f} ₽")
+            f"✅ Заказ #{order_id} оплачен с баланса\n"
+            f"Покупатель: {call.from_user.id} | Сумма: {price:.0f} ₽")
+        return
 
+    # ── Недостаточно средств — предлагаем пополнить ──
+    if balance > 0 and balance < price:
+        need = price - balance
+        try:
+            await call.message.edit_text(
+                f"❌ <b>Недостаточно средств</b>\n\n"
+                f"💰 Цена товара: <b>{price:.0f} ₽</b>\n"
+                f"💳 Твой баланс: <b>{balance:.0f} ₽</b>\n"
+                f"📉 Не хватает: <b>{need:.0f} ₽</b>\n\n"
+                f"Пополни баланс и вернись к покупке 👇",
+                parse_mode="HTML",
+                reply_markup=kb_insufficient(product_id)
+            )
+        except Exception:
+            await call.message.answer(
+                f"❌ <b>Недостаточно средств</b>\n\nНе хватает: <b>{need:.0f} ₽</b>",
+                parse_mode="HTML",
+                reply_markup=kb_insufficient(product_id)
+            )
+        return
+
+    # ── Баланс 0 — оплата через DonationAlerts ──
+    import random, string
+    rand_code  = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    da_comment = f"PAY-{rand_code}"
+
+    order_id = await db.create_order(
+        call.from_user.id, product["seller_id"],
+        product_id, price, commission, da_comment
+    )
+    await db.update_order_status(order_id, "pending_payment")
+    await state.update_data(order_id=order_id, amount=price, da_comment=da_comment)
+    await state.set_state(BuyFSM.waiting_payment)
+
+    text = (
+        f"💳 <b>Оплата заказа #{order_id}</b>\n\n"
+        f"📦 {product['title']}\n"
+        f"💰 Сумма: <b>{price:.0f} ₽</b>\n\n"
+        f"<b>Как оплатить:</b>\n"
+        f"1️⃣ Перейди на DonationAlerts:\n👉 {DA_LINK}\n\n"
+        f"2️⃣ В поле «Сообщение» скопируй и вставь:\n\n"
+        f"<code>{da_comment}</code>\n\n"
+        f"3️⃣ Сумма доната: <b>{price:.0f} ₽</b>\n\n"
+        f"4️⃣ После оплаты нажми кнопку 👇"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb_pay_da(order_id))
+    except Exception:
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb_pay_da(order_id))
+
+
+@router.callback_query(F.data.startswith("check_payment_"))
+async def check_payment(call: CallbackQuery, state: FSMContext, bot: Bot):
+    order_id = int(call.data.split("_")[2])
+    order    = await db.get_order(order_id)
+
+    if not order or order["buyer_id"] != call.from_user.id:
+        await call.answer("Заказ не найден.", show_alert=True)
+        return
+    if order["status"] != "pending_payment":
+        await call.answer("Заказ уже обработан.", show_alert=True)
+        return
+
+    from config import DA_TOKEN
+    if not DA_TOKEN:
+        await call.answer("⚠️ Автопроверка недоступна — токен DA не настроен.", show_alert=True)
+        return
+
+    await call.answer("⏳ Проверяем оплату...", show_alert=False)
+
+    used_ids = await db.get_used_donation_ids()
+    from da_checker import find_matching_donation
+    don = await find_matching_donation(order["da_comment"], order["amount"], used_ids)
+    product = await db.get_product(order["product_id"])
+
+    if don:
+        don_id = don.get("id")
+        if don_id and await db.is_donation_used(don_id):
+            await call.answer("✅ Уже зачислено.", show_alert=True)
+            await state.clear()
+            return
+        if don_id:
+            await db.mark_donation_used(don_id)
+
+        await db.update_order_status(order_id, "paid")
+        seller_gets = round(order["amount"] - order["commission"], 2)
+        await state.clear()
+
+        await call.message.edit_text(
+            f"✅ <b>Оплата подтверждена!</b>\n\n"
+            f"Заказ #{order_id} активен.\n"
+            f"Переписка с продавцом открыта 👇",
+            parse_mode="HTML",
+            reply_markup=kb_order_chat(order_id, "buyer")
+        )
+        await bot.send_message(
+            order["seller_id"],
+            f"🔔 <b>Новый оплаченный заказ #{order_id}!</b>\n\n"
+            f"📦 {product['title'] if product else '?'}\n"
+            f"💰 Ты получишь: <b>{seller_gets:.0f} ₽</b>\n\n"
+            f"Отправь товар и подтверди выдачу 👇",
+            parse_mode="HTML",
+            reply_markup=kb_order_chat(order_id, "seller")
+        )
+        await bot.send_message(ADMIN_ID,
+            f"✅ Заказ #{order_id} оплачен через DA\n"
+            f"Покупатель: {call.from_user.id} | Сумма: {order['amount']:.0f} ₽")
     else:
-        # ❌ Оплата не найдена — только кнопка «Проверить снова»
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        da_comment = order["da_comment"]
+        amount     = order["amount"]
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔄 Проверить снова", callback_data=f"check_payment_{order_id}")],
             [InlineKeyboardButton(text="❌ Отмена",           callback_data="market")]
         ])
         await call.message.edit_text(
             f"❌ <b>Оплата не найдена</b>\n\n"
-            f"Убедись что:\n"
-            f"• Сумма: <b>{order['amount']:.0f} ₽</b>\n"
-            f"• В сообщении написано точно: <code>{order['da_comment']}</code>\n\n"
-            f"Подожди 1–2 минуты и проверь снова 👇",
-            parse_mode="HTML",
-            reply_markup=kb
+            f"Повтори шаги:\n\n"
+            f"1️⃣ Перейди: {DA_LINK}\n\n"
+            f"2️⃣ Скопируй код (нажми чтобы скопировать):\n\n"
+            f"<code>{da_comment}</code>\n\n"
+            f"3️⃣ Сумма: <b>{amount:.0f} ₽</b>\n\n"
+            f"💡 Бот проверяет автоматически каждые 15 сек.",
+            parse_mode="HTML", reply_markup=kb
         )
