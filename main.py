@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -7,6 +8,7 @@ from config import BOT_TOKEN
 from database import init_db
 from handlers import start, profile, market, sell, buy, wallet, chat, messenger, admin
 from payment_poller import payment_polling_loop
+from api import app as fastapi_app
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,11 +25,20 @@ dp.include_router(wallet.router)
 dp.include_router(chat.router)
 dp.include_router(admin.router)
 
+
+async def run_api():
+    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=8000, log_level="warning")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 async def main():
     await init_db()
-    # Запускаем фоновый поллер оплат параллельно с ботом
-    asyncio.create_task(payment_polling_loop(bot))
-    await dp.start_polling(bot)
+    await asyncio.gather(
+        run_api(),
+        payment_polling_loop(bot),
+        dp.start_polling(bot),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
