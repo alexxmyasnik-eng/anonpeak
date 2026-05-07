@@ -1,6 +1,6 @@
 import os
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "8525276997:AAGyRtyV1JeQIrQWdALmYvVUo5_lfPE3v-I")
 CHANNEL_ID  = os.getenv("CHANNEL_ID", "@AnonPeak")          # канал для входа в бота
 CHAT_CHANNEL = os.getenv("CHAT_CHANNEL", "@AnonPeakChat")   # канал для входа в чат (другой!)
 CHAT_GROUP_ID = int(os.getenv("CHAT_GROUP_ID", "-1003755595234"))  # группа куда пересылаются сообщения
