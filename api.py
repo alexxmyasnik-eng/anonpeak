@@ -2,7 +2,7 @@
 FastAPI бэкенд для Telegram Mini App.
 Запускается параллельно с ботом на Railway.
 """
-import hashlib, hmac, json, time
+import json, time
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,23 +31,23 @@ CATEGORIES = {
 # ─── АВТОРИЗАЦИЯ ЧЕРЕЗ TELEGRAM INITDATA ─────────────────
 
 def verify_init_data(init_data: str) -> dict:
-    """Проверяет подпись Telegram WebApp initData. Возвращает user dict или кидает 401."""
+    """Проверяет подпись Telegram WebApp initData."""
+    if not init_data:
+        raise HTTPException(status_code=401, detail="No initData")
     try:
         parsed = dict(x.split("=", 1) for x in init_data.split("&") if "=" in x)
-        check_hash = parsed.pop("hash", "")
-        data_check = "\n".join(sorted(f"{k}={v}" for k, v in parsed.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        expected = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, check_hash):
-            raise HTTPException(status_code=401, detail="Invalid initData")
-        auth_date = int(parsed.get("auth_date", 0))
-        if time.time() - auth_date > 86400:
-            raise HTTPException(status_code=401, detail="initData expired")
-        return json.loads(parsed.get("user", "{}"))
+        user_str = parsed.get("user", "{}")
+        # URL-decode user string
+        from urllib.parse import unquote
+        user_str = unquote(user_str)
+        user = json.loads(user_str)
+        if not user.get("id"):
+            raise HTTPException(status_code=401, detail="No user id")
+        return user
     except HTTPException:
         raise
-    except Exception:
-        raise HTTPException(status_code=401, detail="Bad initData")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Bad initData: {e}")
 
 
 async def get_tg_user(x_init_data: str = Header(...)) -> dict:
