@@ -1,5 +1,8 @@
 import aiohttp
+from datetime import datetime, timezone, timedelta
 from config import DA_TOKEN
+
+CHECK_WINDOW_MINUTES = 15
 
 async def _fetch_donations():
     if not DA_TOKEN:
@@ -9,6 +12,8 @@ async def _fetch_donations():
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 401:
+                    return "invalid_token"
                 if r.status != 200:
                     return None
                 data = await r.json()
@@ -16,44 +21,60 @@ async def _fetch_donations():
     except Exception:
         return None
 
-async def _get_donation_amount(expected_comment: str) -> float:
-    donations = await _fetch_donations()
-    if not donations:
-        return 0.0
-    for d in donations:
-        if expected_comment.lower() in (d.get("message") or "").lower():
-            return float(d.get("amount") or 0)
-    return 0.0
-
 async def check_donation(expected_comment: str, expected_amount: float = 1.0):
     """
-    Проверяет последние донаты через DonationAlerts API.
-    Ищет донат с нужным комментарием и суммой.
-    
-    Получи токен: https://www.donationalerts.com/application/clients
-    → Create Application → получи access_token
+    True  = донат найден
+    False = не найден за последние 15 минут
+    None  = токен не настроен / ошибка (ручная проверка)
     """
-    if not DA_TOKEN:
-        # Если токен не настроен — пропускаем проверку (ручной режим)
-        return None  # None = не проверяли (токен не настроен)
+    donations = await _fetch_donations()
+    if donations is None or donations == "invalid_token":
+        return None
+    if not isinstance(donations, list):
+        return None
 
-    url = "https://www.donationalerts.com/api/v1/alerts/donations"
-    headers = {"Authorization": f"Bearer {DA_TOKEN}"}
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=CHECK_WINDOW_MINUTES)
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
+    for d in donations:
+        # Фильтр по времени
+        created_at_str = d.get("created_at") or d.get("shown_at") or ""
+        if created_at_str:
+            try:
+                dt = datetime.strptime(created_at_str[:19], "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+                if dt < window_start:
+                    continue
+            except Exception:
+                pass
 
-        donations = data.get("data", [])
-        for d in donations:
-            comment = (d.get("message") or "").lower()
-            amount  = float(d.get("amount") or 0)
-            # Ищем донат где в комментарии есть нужный текст и сумма совпадает
-            if expected_comment.lower() in comment and amount >= expected_amount * 0.95:
-                return True
-        return False
-    except Exception:
-        return None  # ошибка сети — не можем проверить
+        comment = (d.get("message") or "").lower().strip()
+        amount  = float(d.get("amount") or 0)
+
+        if expected_comment.lower() in comment and amount >= expected_amount * 0.95:
+            return True
+
+    return False
+
+async def _get_donation_amount(expected_comment: str) -> float:
+    donations = await _fetch_donations()
+    if not donations or not isinstance(donations, list):
+        return 0.0
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=CHECK_WINDOW_MINUTES)
+
+    for d in donations:
+        created_at_str = d.get("created_at") or d.get("shown_at") or ""
+        if created_at_str:
+            try:
+                dt = datetime.strptime(created_at_str[:19], "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+                if dt < window_start:
+                    continue
+            except Exception:
+                pass
+        comment = (d.get("message") or "").lower().strip()
+        if expected_comment.lower() in comment:
+            return float(d.get("amount") or 0)
+    return 0.0
