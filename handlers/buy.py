@@ -6,7 +6,7 @@ from aiogram.fsm.state import State, StatesGroup
 import database as db
 from config import DA_LINK, BOT_COMMISSION, ADMIN_ID
 from da_checker import get_donation_amount_by_comment
-from keyboards.inline import kb_order_chat, kb_main_menu
+from keyboards.inline import kb_main_menu
 
 router = Router()
 
@@ -57,23 +57,32 @@ async def start_buy(call: CallbackQuery, state: FSMContext, bot: Bot):
         )
         await db.update_order_status(order_id, "paid")
 
+        seller = await db.get_user(product["seller_id"])
+        s_nick = seller["nickname"] if seller else "продавец"
+        new_balance = balance - price
         await call.message.edit_text(
-            f"✅ <b>Оплачено с баланса!</b>\n\n"
+            f"✅ <b>Товар приобретён!</b>\n\n"
             f"📦 {product['title']}\n"
             f"💰 Списано: <b>{price:.0f} ₽</b>\n"
-            f"💳 Остаток: <b>{balance - price:.0f} ₽</b>\n\n"
-            f"Переписка с продавцом открыта 👇",
+            f"💳 Ваш баланс: <b>{new_balance:.0f} ₽</b>\n\n"
+            f"Диалог с продавцом открыт — он получил уведомление.",
             parse_mode="HTML",
-            reply_markup=kb_order_chat(order_id, "buyer")
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"💬 Открыть диалог с {s_nick}", callback_data=f"order_chat_{order_id}")
+            ]])
         )
+        seller = await db.get_user(product["seller_id"])
+        buyer  = await db.get_user(call.from_user.id)
         await bot.send_message(
             product["seller_id"],
-            f"🔔 <b>Новый заказ #{order_id}!</b>\n\n"
+            f"💸 <b>Новый заказ!</b>\n\n"
+            f"Вы получили новый заказ от <b>{buyer['nickname']}</b>\n\n"
             f"📦 {product['title']}\n"
-            f"💰 Ты получишь: <b>{seller_gets:.0f} ₽</b>\n\n"
-            f"Отправь товар покупателю и подтверди выдачу 👇",
+            f"💰 Вы получите: <b>{seller_gets:.0f} ₽</b>",
             parse_mode="HTML",
-            reply_markup=kb_order_chat(order_id, "seller")
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📦 Открыть заказ", callback_data=f"order_chat_{order_id}")
+            ]])
         )
         await bot.send_message(ADMIN_ID,
             f"✅ Заказ #{order_id} оплачен с баланса\n"
@@ -168,21 +177,29 @@ async def check_payment(call: CallbackQuery, state: FSMContext, bot: Bot):
         seller_gets = round(order["amount"] - order["commission"], 2)
         await state.clear()
 
+        seller = await db.get_user(order["seller_id"])
+        s_nick = seller["nickname"] if seller else "продавец"
         await call.message.edit_text(
-            f"✅ <b>Оплата подтверждена!</b>\n\n"
-            f"Заказ #{order_id} активен.\n"
-            f"Переписка с продавцом открыта 👇",
+            f"✅ <b>Товар приобретён!</b>\n\n"
+            f"📦 {product['title'] if product else '?'}\n"
+            f"💰 Оплачено: <b>{order['amount']:.0f} ₽</b>\n\n"
+            f"Диалог с продавцом открыт — он получил уведомление.",
             parse_mode="HTML",
-            reply_markup=kb_order_chat(order_id, "buyer")
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"💬 Открыть диалог с {s_nick}", callback_data=f"order_chat_{order_id}")
+            ]])
         )
+        buyer = await db.get_user(call.from_user.id)
         await bot.send_message(
             order["seller_id"],
-            f"🔔 <b>Новый оплаченный заказ #{order_id}!</b>\n\n"
+            f"💸 <b>Новый заказ!</b>\n\n"
+            f"Вы получили новый заказ от <b>{buyer['nickname']}</b>\n\n"
             f"📦 {product['title'] if product else '?'}\n"
-            f"💰 Ты получишь: <b>{seller_gets:.0f} ₽</b>\n\n"
-            f"Отправь товар и подтверди выдачу 👇",
+            f"💰 Вы получите: <b>{seller_gets:.0f} ₽</b>",
             parse_mode="HTML",
-            reply_markup=kb_order_chat(order_id, "seller")
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📦 Открыть заказ", callback_data=f"order_chat_{order_id}")
+            ]])
         )
         await bot.send_message(ADMIN_ID,
             f"✅ Заказ #{order_id} оплачен через DA\n"
