@@ -97,7 +97,10 @@ async def topup_amount_chosen(call: CallbackQuery, state: FSMContext):
 
 async def _show_pay_screen(event, state: FSMContext, amount: int, is_msg: bool):
     uid = event.from_user.id
-    da_comment = f"Топап {uid} {amount}"
+    # Уникальный код — 6 случайных букв+цифр, чтобы не путались донаты
+    import random, string
+    rand_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    da_comment = f"PAY-{rand_code}"
 
     # Сохраняем в БД — поллер найдёт сам, даже если кнопку не нажали
     await db.create_topup(uid, amount, da_comment)
@@ -189,11 +192,17 @@ async def topup_check(call: CallbackQuery, state: FSMContext, bot: Bot):
             [InlineKeyboardButton(text="🔄 Проверить снова", callback_data="topup_paid")],
             [InlineKeyboardButton(text="◀️ Отмена",          callback_data="wallet")],
         ])
+        from config import DA_LINK as _DA_LINK
         await call.message.edit_text(
             f"❌ <b>Оплата не найдена</b>\n\n"
-            f"Убедись что в поле «Сообщение» написано точно:\n"
+            f"Повтори шаги:\n\n"
+            f"1️⃣ Перейди на DonationAlerts:\n"
+            f"👉 {_DA_LINK}\n\n"
+            f"2️⃣ В поле «Сообщение» скопируй и вставь <b>точно этот код</b>\n"
+            f"(нажми на него чтобы скопировать):\n\n"
             f"<code>{da_comment}</code>\n\n"
-            f"Сумма: <b>{expected_amount} ₽</b>\n\n"
+            f"3️⃣ Сумма доната: <b>{expected_amount} ₽</b>\n\n"
+            f"4️⃣ После оплаты нажми «Проверить снова»\n\n"
             f"💡 Бот проверяет автоматически каждые 15 сек.",
             parse_mode="HTML", reply_markup=kb
         )
