@@ -1,6 +1,6 @@
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, BotCommand, BotCommandScopeDefault
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 
 import database as db
 from config import CHANNEL_ID
@@ -26,7 +26,14 @@ async def is_subscribed(bot: Bot, user_id: int, channel: str) -> bool:
 
 async def setup_menu(bot: Bot):
     await bot.set_my_commands([
-        BotCommand(command="start", description="🏠 Главное меню")
+        BotCommand(command="start",   description="🏠 Главное меню"),
+        BotCommand(command="market",  description="🛍 Маркет — купить товар"),
+        BotCommand(command="balance", description="💰 Мой баланс"),
+        BotCommand(command="donate",  description="💳 Пополнить баланс"),
+        BotCommand(command="profile", description="👤 Мой профиль"),
+        BotCommand(command="chat",    description="💬 Общий чат"),
+        BotCommand(command="messages",description="✉️ Мои сообщения"),
+        BotCommand(command="sell",    description="➕ Выставить товар"),
     ])
 
 @router.message(CommandStart())
@@ -116,3 +123,83 @@ async def cb_main_menu(call: CallbackQuery):
     except Exception:
         await call.message.answer(WELCOME, parse_mode="HTML",
                                   reply_markup=kb_main_menu(bool(user["nickname"]), unread))
+
+
+# ─── КОМАНДЫ МЕНЮ ────────────────────────────────────────
+
+@router.message(Command("market"))
+async def cmd_market(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["is_adult"]: return
+    from keyboards.inline import kb_market
+    await message.answer("🛍 <b>Маркет</b>\n\nВыбери категорию:", parse_mode="HTML", reply_markup=kb_market())
+
+@router.message(Command("balance"))
+async def cmd_balance(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["is_adult"]: return
+    from keyboards.inline import kb_wallet
+    balance = await db.get_balance(message.from_user.id)
+    await message.answer(f"💰 Твой баланс: <b>{balance:.0f} ₽</b>", parse_mode="HTML", reply_markup=kb_wallet())
+
+@router.message(Command("donate"))
+async def cmd_donate(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["is_adult"]: return
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="topup")
+    ]])
+    await message.answer("💳 Пополнение баланса:", reply_markup=kb)
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["is_adult"]: return
+    from aiogram.types import CallbackQuery
+    # Имитируем через answer
+    from keyboards.inline import kb_profile, kb_main_menu as kmm
+    if not user["nickname"]:
+        await message.answer("У тебя нет профиля.", reply_markup=kmm(False))
+        return
+    text = (
+        f"👤 <b>Профиль</b>\n\n"
+        f"Ник: <b>{user['nickname']}</b>\n"
+        f"Возраст: <b>{user['age']}</b>\n"
+        f"Баланс: <b>{await db.get_balance(message.from_user.id):.0f} ₽</b>"
+    )
+    kb = kb_profile()
+    if user["avatar_id"]:
+        await message.answer_photo(user["avatar_id"], caption=text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@router.message(Command("chat"))
+async def cmd_chat(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["is_adult"]: return
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💬 Открыть чат", callback_data="open_chat")
+    ]])
+    await message.answer("💬 Общий чат:", reply_markup=kb)
+
+@router.message(Command("messages"))
+async def cmd_messages(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["is_adult"]: return
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✉️ Мои сообщения", callback_data="messages")
+    ]])
+    await message.answer("✉️ Переписка:", reply_markup=kb)
+
+@router.message(Command("sell"))
+async def cmd_sell(message: Message):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["nickname"]: return
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➕ Выставить товар", callback_data="sell_item")
+    ]])
+    await message.answer("➕ Выставить товар на маркет:", reply_markup=kb)
