@@ -50,7 +50,9 @@ def verify_init_data(init_data: str) -> dict:
         raise HTTPException(status_code=401, detail=f"Bad initData: {e}")
 
 
-async def get_tg_user(x_init_data: str = Header(...)) -> dict:
+async def get_tg_user(x_init_data: str = Header(default="")) -> dict:
+    if not x_init_data:
+        raise HTTPException(status_code=401, detail="No initData — открой через Telegram бота")
     tg = verify_init_data(x_init_data)
     uid = tg.get("id")
     if not uid:
