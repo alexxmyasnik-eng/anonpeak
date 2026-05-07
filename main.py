@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -26,16 +27,20 @@ dp.include_router(chat.router)
 dp.include_router(admin.router)
 
 
-async def run_api():
-    config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=8000, log_level="warning")
-    server = uvicorn.Server(config)
-    await server.serve()
+def run_api():
+    """Запускает FastAPI в отдельном потоке."""
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
 
 
 async def main():
     await init_db()
+
+    # API в отдельном потоке — не мешает боту
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
+
+    # Поллер и бот в asyncio
     await asyncio.gather(
-        run_api(),
         payment_polling_loop(bot),
         dp.start_polling(bot),
     )
