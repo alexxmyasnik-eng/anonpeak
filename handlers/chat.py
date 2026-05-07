@@ -53,10 +53,14 @@ async def chat_sub_check(call: CallbackQuery, bot: Bot, state: FSMContext):
     await _enter_chat(call, state, user)
 
 async def _enter_chat(call: CallbackQuery, state: FSMContext, user):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    from config import CHAT_CHANNEL
     uid = call.from_user.id
 
     # Проверяем кулдаун
     last = await db.get_last_chat_time(uid)
+    cooldown_text = ""
+    can_write = True
     if last:
         try:
             last_dt = datetime.fromisoformat(str(last)).replace(tzinfo=timezone.utc)
@@ -65,30 +69,54 @@ async def _enter_chat(call: CallbackQuery, state: FSMContext, user):
             if diff < CHAT_COOLDOWN:
                 mins = int((CHAT_COOLDOWN - diff) // 60)
                 secs = int((CHAT_COOLDOWN - diff) % 60)
-                await call.answer(
-                    f"⏳ Следующее сообщение через {mins}м {secs}с",
-                    show_alert=True
-                )
-                return
+                cooldown_text = f"\n\n⏳ Следующее сообщение через <b>{mins} мин {secs} сек</b>"
+                can_write = False
         except Exception:
             pass
 
-    await state.set_state(ChatFSM.writing)
+    # Кнопки: ссылка на чат + написать (если можно) + назад
+    buttons = [
+        [InlineKeyboardButton(text="👥 Перейти в чат", url=f"https://t.me/{CHAT_CHANNEL.lstrip('@')}")]
+    ]
+    if can_write:
+        buttons.append([InlineKeyboardButton(text="✏️ Написать в чат", callback_data="do_write_chat")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    text = (
+        "💬 <b>Общий чат</b>\n\n"
+        "Здесь можно написать сообщение — оно появится в чате с твоим профилем.\n"
+        "⏰ Можно писать раз в 30 минут.\n"
+        "⚠️ Соблюдай правила — за спам бан."
+        + cooldown_text
+    )
     try:
-        await call.message.edit_text(
-            "💬 <b>Общий чат</b>\n\n"
-            "Напиши сообщение (текст, фото или видео).\n"
-            "⏰ Можно писать раз в 30 минут.\n"
-            "⚠️ Соблюдай правила — за спам бан.",
-            parse_mode="HTML",
-            reply_markup=kb_back("main_menu")
-        )
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
-        await call.message.answer(
-            "💬 <b>Общий чат</b>\n\nНапиши сообщение:",
-            parse_mode="HTML",
-            reply_markup=kb_back("main_menu")
-        )
+        await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data == "do_write_chat")
+async def do_write_chat(call: CallbackQuery, state: FSMContext):
+    from keyboards.inline import kb_back
+    # Финальная проверка кулдауна
+    last = await db.get_last_chat_time(call.from_user.id)
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(str(last)).replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            diff = (now - last_dt).total_seconds()
+            if diff < CHAT_COOLDOWN:
+                mins = int((CHAT_COOLDOWN - diff) // 60)
+                await call.answer(f"⏳ Подожди ещё {mins} мин.", show_alert=True)
+                return
+        except Exception:
+            pass
+    await state.set_state(ChatFSM.writing)
+    await call.message.edit_text(
+        "💬 Напиши сообщение (текст, фото или видео):",
+        reply_markup=kb_back("open_chat")
+    )
 
 @router.message(ChatFSM.writing, F.text | F.photo | F.video | F.sticker)
 async def handle_chat_msg(message: Message, bot: Bot, state: FSMContext):
