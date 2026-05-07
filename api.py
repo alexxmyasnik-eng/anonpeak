@@ -95,11 +95,11 @@ async def get_me(ctx: dict = Depends(get_tg_user)):
     }
 
 @app.get("/categories")
-async def get_categories(ctx: dict = Depends(get_tg_user)):
+async def get_categories():
     return [{"id": k, "name": v} for k, v in CATEGORIES.items()]
 
 @app.get("/products/{category}")
-async def get_products(category: str, ctx: dict = Depends(get_tg_user)):
+async def get_products(category: str):
     if category not in CATEGORIES:
         raise HTTPException(404, "Category not found")
     products = await db.get_products_by_category(category)
@@ -113,7 +113,7 @@ async def get_products(category: str, ctx: dict = Depends(get_tg_user)):
     return result
 
 @app.get("/product/{product_id}")
-async def get_product(product_id: int, ctx: dict = Depends(get_tg_user)):
+async def get_product(product_id: int):
     p = await db.get_product(product_id)
     if not p:
         raise HTTPException(404, "Not found")
