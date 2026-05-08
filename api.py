@@ -75,14 +75,26 @@ async def get_product(product_id: int):
 @app.get("/me")
 async def get_me(uid: int = Depends(get_uid)):
     u = await db.get_user(uid)
+    gender = ""
+    try:
+        import aiosqlite
+        from config import DB_PATH
+        async with aiosqlite.connect(DB_PATH) as d:
+            async with d.execute("SELECT gender FROM users WHERE user_id=?", (uid,)) as c:
+                row = await c.fetchone()
+                if row and row[0]: gender = row[0]
+    except Exception:
+        pass
     return {
         "uid": uid, "nickname": u["nickname"], "age": u["age"],
         "balance": float(u["balance"]), "avatar_id": u["avatar_id"],
+        "gender": gender,
     }
 
 class UpdateProfileRequest(BaseModel):
     nickname: str
     age: int
+    gender: str = ""
 
 @app.post("/me/update")
 async def update_profile(req: UpdateProfileRequest, uid: int = Depends(get_uid)):
@@ -92,6 +104,18 @@ async def update_profile(req: UpdateProfileRequest, uid: int = Depends(get_uid))
         raise HTTPException(400, "Укажи реальный возраст")
     u = await db.get_user(uid)
     await db.update_profile(uid, req.nickname, req.age, u["avatar_id"] if u else None)
+    try:
+        import aiosqlite
+        from config import DB_PATH
+        async with aiosqlite.connect(DB_PATH) as d:
+            try:
+                await d.execute("ALTER TABLE users ADD COLUMN gender TEXT")
+            except Exception:
+                pass
+            await d.execute("UPDATE users SET gender=? WHERE user_id=?", (req.gender, uid))
+            await d.commit()
+    except Exception:
+        pass
     return {"ok": True}
 
 @app.get("/orders")
