@@ -1,24 +1,13 @@
-"""
-FastAPI бэкенд для Telegram Mini App.
-Запускается параллельно с ботом на Railway.
-"""
-import json, time
-from typing import Optional
+import json
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+from urllib.parse import unquote
 import database as db
-from config import BOT_TOKEN, BOT_COMMISSION, DA_LINK, ADMIN_ID
+from config import BOT_COMMISSION, DA_LINK, ADMIN_ID
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 CATEGORIES = {
     "signa":  "🖊 Сигна",
@@ -27,72 +16,21 @@ CATEGORIES = {
     "videos": "🎬 Видео",
 }
 
+# ── AUTH ─────────────────────────────────────────────────
 
-# ─── АВТОРИЗАЦИЯ ЧЕРЕЗ TELEGRAM INITDATA ─────────────────
-
-def verify_init_data(init_data: str) -> dict:
-    """Проверяет подпись Telegram WebApp initData."""
-    if not init_data:
-        raise HTTPException(status_code=401, detail="No initData")
-    try:
-        parsed = dict(x.split("=", 1) for x in init_data.split("&") if "=" in x)
-        user_str = parsed.get("user", "{}")
-        # URL-decode user string
-        from urllib.parse import unquote
-        user_str = unquote(user_str)
-        user = json.loads(user_str)
-        if not user.get("id"):
-            raise HTTPException(status_code=401, detail="No user id")
-        return user
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Bad initData: {e}")
-
-
-async def get_tg_user(x_init_data: str = Header(default="")) -> dict:
-    if not x_init_data:
-        raise HTTPException(status_code=401, detail="No initData — открой через Telegram бота")
-    tg = verify_init_data(x_init_data)
-    uid = tg.get("id")
-    if not uid:
-        raise HTTPException(status_code=401, detail="No user id")
+async def get_uid(x_tg_user_id: str = Header(default="")) -> int:
+    if not x_tg_user_id or not x_tg_user_id.isdigit():
+        raise HTTPException(401, "Unauthorized")
+    uid = int(x_tg_user_id)
     user = await db.get_user(uid)
     if not user:
-        await db.create_user(uid, tg.get("username", ""))
-        user = await db.get_user(uid)
-    return {"tg": tg, "db": user, "uid": uid}
+        await db.create_user(uid, "")
+    return uid
 
+# ── PUBLIC ───────────────────────────────────────────────
 
-def _product_dict(p) -> dict:
-    return {
-        "id": p["id"], "title": p["title"], "description": p["description"],
-        "price": p["price"], "category": p["category"],
-        "media_id": p["media_id"], "media_type": p["media_type"],
-        "seller_id": p["seller_id"],
-    }
-
-
-def _order_dict(o) -> dict:
-    return {
-        "id": o["id"], "short_id": o["short_id"] or f"#{o['id']}",
-        "product_id": o["product_id"], "amount": o["amount"],
-        "status": o["status"], "buyer_id": o["buyer_id"], "seller_id": o["seller_id"],
-    }
-
-
-# ─── ЭНДПОИНТЫ ───────────────────────────────────────────
-
-@app.get("/me")
-async def get_me(ctx: dict = Depends(get_tg_user)):
-    u = ctx["db"]
-    return {
-        "uid": ctx["uid"],
-        "nickname": u["nickname"] if u else None,
-        "age": u["age"] if u else None,
-        "balance": float(u["balance"]) if u else 0.0,
-        "avatar_id": u["avatar_id"] if u else None,
-    }
+@app.get("/health")
+async def health(): return {"ok": True}
 
 @app.get("/categories")
 async def get_categories():
@@ -101,89 +39,94 @@ async def get_categories():
 @app.get("/products/{category}")
 async def get_products(category: str):
     if category not in CATEGORIES:
-        raise HTTPException(404, "Category not found")
+        raise HTTPException(404, "Not found")
     products = await db.get_products_by_category(category)
     result = []
     for p in products:
         seller = await db.get_user(p["seller_id"])
-        d = _product_dict(p)
-        d["seller_nick"] = seller["nickname"] if seller else "?"
-        d["seller_rating"] = (await db.get_seller_rating(p["seller_id"]))[0]
-        result.append(d)
+        avg, _ = await db.get_seller_rating(p["seller_id"])
+        result.append({
+            "id": p["id"], "title": p["title"], "description": p["description"],
+            "price": p["price"], "category": p["category"],
+            "media_id": p["media_id"], "media_type": p["media_type"],
+            "seller_id": p["seller_id"],
+            "seller_nick": seller["nickname"] if seller else "?",
+            "seller_rating": avg,
+        })
     return result
 
 @app.get("/product/{product_id}")
 async def get_product(product_id: int):
     p = await db.get_product(product_id)
-    if not p:
-        raise HTTPException(404, "Not found")
+    if not p: raise HTTPException(404, "Not found")
     seller = await db.get_user(p["seller_id"])
     avg, cnt = await db.get_seller_rating(p["seller_id"])
-    d = _product_dict(p)
-    d["seller_nick"] = seller["nickname"] if seller else "?"
-    d["seller_rating"] = avg
-    d["seller_reviews"] = cnt
-    return d
+    return {
+        "id": p["id"], "title": p["title"], "description": p["description"],
+        "price": p["price"], "category": p["category"],
+        "media_id": p["media_id"], "media_type": p["media_type"],
+        "seller_id": p["seller_id"],
+        "seller_nick": seller["nickname"] if seller else "?",
+        "seller_rating": avg, "seller_reviews": cnt,
+    }
 
-class BuyRequest(BaseModel):
-    product_id: int
+# ── AUTH REQUIRED ─────────────────────────────────────────
 
-@app.post("/buy")
-async def buy_product(req: BuyRequest, ctx: dict = Depends(get_tg_user)):
-    uid = ctx["uid"]
-    p = await db.get_product(req.product_id)
-    if not p or p["status"] != "active":
-        raise HTTPException(400, "Product unavailable")
-    if p["seller_id"] == uid:
-        raise HTTPException(400, "Cannot buy own product")
+@app.get("/me")
+async def get_me(uid: int = Depends(get_uid)):
+    u = await db.get_user(uid)
+    return {
+        "uid": uid, "nickname": u["nickname"], "age": u["age"],
+        "balance": float(u["balance"]), "avatar_id": u["avatar_id"],
+    }
 
-    price = p["price"]
-    commission = round(price * BOT_COMMISSION, 2)
-    balance = await db.get_balance(uid)
+class UpdateProfileRequest(BaseModel):
+    nickname: str
+    age: int
 
-    if balance < price:
-        return {"ok": False, "reason": "insufficient", "balance": balance, "price": price}
-
-    await db.change_balance(uid, -price)
-    order_id = await db.create_order(uid, p["seller_id"], req.product_id, price, commission, "")
-    await db.update_order_status(order_id, "paid")
-    order = await db.get_order(order_id)
-    return {"ok": True, "order": _order_dict(order)}
+@app.post("/me/update")
+async def update_profile(req: UpdateProfileRequest, uid: int = Depends(get_uid)):
+    if not req.nickname or len(req.nickname) > 30:
+        raise HTTPException(400, "Никнейм от 1 до 30 символов")
+    if req.age < 1 or req.age > 120:
+        raise HTTPException(400, "Укажи реальный возраст")
+    u = await db.get_user(uid)
+    await db.update_profile(uid, req.nickname, req.age, u["avatar_id"] if u else None)
+    return {"ok": True}
 
 @app.get("/orders")
-async def get_orders(ctx: dict = Depends(get_tg_user)):
-    uid = ctx["uid"]
+async def get_orders(uid: int = Depends(get_uid)):
     orders = await db.get_orders_for_user(uid)
     result = []
     for o in orders:
         partner_id = o["seller_id"] if o["buyer_id"] == uid else o["buyer_id"]
         partner = await db.get_user(partner_id)
         p = await db.get_product(o["product_id"])
-        d = _order_dict(o)
-        d["partner_nick"] = partner["nickname"] if partner else "?"
-        d["product_title"] = p["title"] if p else "?"
-        d["role"] = "buyer" if o["buyer_id"] == uid else "seller"
-        result.append(d)
+        result.append({
+            "id": o["id"], "short_id": o["short_id"] or f"#{o['id']}",
+            "product_title": p["title"] if p else "?",
+            "amount": o["amount"], "status": o["status"],
+            "buyer_id": o["buyer_id"], "seller_id": o["seller_id"],
+            "partner_nick": partner["nickname"] if partner else "?",
+            "role": "buyer" if o["buyer_id"] == uid else "seller",
+        })
     return result
 
 @app.get("/orders/{order_id}/messages")
-async def get_messages(order_id: int, ctx: dict = Depends(get_tg_user)):
-    uid = ctx["uid"]
+async def get_messages(order_id: int, uid: int = Depends(get_uid)):
     order = await db.get_order(order_id)
     if not order or uid not in (order["buyer_id"], order["seller_id"]):
         raise HTTPException(403, "No access")
     await db.mark_read(order_id, uid)
     msgs = await db.get_order_messages(order_id)
     return [{"id": m["id"], "sender_id": m["sender_id"], "text": m["text"],
-             "media_id": m["media_id"], "media_type": m["media_type"],
-             "is_read": m["is_read"], "created_at": str(m["created_at"])} for m in msgs]
+             "media_type": m["media_type"], "created_at": str(m["created_at"])} for m in msgs]
 
 class SendMsgRequest(BaseModel):
     text: str
 
 @app.post("/orders/{order_id}/messages")
-async def send_message(order_id: int, req: SendMsgRequest, ctx: dict = Depends(get_tg_user)):
-    uid = ctx["uid"]
+async def send_message(order_id: int, req: SendMsgRequest, uid: int = Depends(get_uid)):
     order = await db.get_order(order_id)
     if not order or uid not in (order["buyer_id"], order["seller_id"]):
         raise HTTPException(403, "No access")
@@ -191,12 +134,31 @@ async def send_message(order_id: int, req: SendMsgRequest, ctx: dict = Depends(g
     await db.send_msg(order_id, uid, partner_id, text=req.text)
     return {"ok": True}
 
+class BuyRequest(BaseModel):
+    product_id: int
+
+@app.post("/buy")
+async def buy_product(req: BuyRequest, uid: int = Depends(get_uid)):
+    p = await db.get_product(req.product_id)
+    if not p or p["status"] != "active":
+        raise HTTPException(400, "Товар недоступен")
+    if p["seller_id"] == uid:
+        raise HTTPException(400, "Нельзя купить свой товар")
+    balance = await db.get_balance(uid)
+    if balance < p["price"]:
+        return {"ok": False, "reason": "insufficient", "balance": balance, "price": p["price"]}
+    commission = round(p["price"] * BOT_COMMISSION, 2)
+    await db.change_balance(uid, -p["price"])
+    order_id = await db.create_order(uid, p["seller_id"], req.product_id, p["price"], commission, "")
+    await db.update_order_status(order_id, "paid")
+    order = await db.get_order(order_id)
+    return {"ok": True, "short_id": order["short_id"] or f"#{order_id}"}
+
 class ConfirmOrderRequest(BaseModel):
     order_id: int
 
 @app.post("/confirm_order")
-async def confirm_order(req: ConfirmOrderRequest, ctx: dict = Depends(get_tg_user)):
-    uid = ctx["uid"]
+async def confirm_order(req: ConfirmOrderRequest, uid: int = Depends(get_uid)):
     order = await db.get_order(req.order_id)
     if not order or order["buyer_id"] != uid:
         raise HTTPException(403, "No access")
@@ -205,17 +167,50 @@ async def confirm_order(req: ConfirmOrderRequest, ctx: dict = Depends(get_tg_use
     seller_gets = round(order["amount"] - order["commission"], 2)
     await db.change_balance(order["seller_id"], seller_gets)
     await db.update_order_status(req.order_id, "done")
-    return {"ok": True, "seller_gets": seller_gets}
+    return {"ok": True}
 
 @app.get("/topup/init/{amount}")
-async def topup_init(amount: int, ctx: dict = Depends(get_tg_user)):
-    uid = ctx["uid"]
-    if amount < 10:
-        raise HTTPException(400, "Min 10")
+async def topup_init(amount: int, uid: int = Depends(get_uid)):
+    if amount < 10: raise HTTPException(400, "Min 10")
     da_comment = f"Топап {uid} {amount}"
     topup_id = await db.create_topup(uid, amount, da_comment)
     return {"topup_id": topup_id, "da_comment": da_comment, "da_link": DA_LINK, "amount": amount}
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+class CreateProductRequest(BaseModel):
+    title: str
+    description: str
+    price: float
+    category: str
+
+@app.post("/products/create")
+async def create_product(req: CreateProductRequest, uid: int = Depends(get_uid)):
+    if req.category not in CATEGORIES:
+        raise HTTPException(400, "Неверная категория")
+    if not req.title or len(req.title) > 100:
+        raise HTTPException(400, "Название от 1 до 100 символов")
+    from config import MIN_PRICE
+    if req.price < MIN_PRICE:
+        raise HTTPException(400, f"Минимальная цена {MIN_PRICE} ₽")
+    product_id = await db.create_product(uid, req.title, req.description, req.price, req.category)
+    return {"ok": True, "product_id": product_id}
+
+class SupportRequest(BaseModel):
+    message: str
+
+@app.post("/support")
+async def support(req: SupportRequest, uid: int = Depends(get_uid)):
+    ticket_id = await db.create_support_ticket(uid, req.message)
+    # Уведомляем админа через бота
+    try:
+        import aiohttp
+        u = await db.get_user(uid)
+        nick = u["nickname"] if u and u["nickname"] else f"ID:{uid}"
+        from config import BOT_TOKEN
+        async with aiohttp.ClientSession() as s:
+            await s.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": ADMIN_ID, "text": f"🆘 Поддержка #{ticket_id}\n👤 {nick} (ID:{uid})\n\n{req.message}"}
+            )
+    except Exception:
+        pass
+    return {"ok": True, "ticket_id": ticket_id}
