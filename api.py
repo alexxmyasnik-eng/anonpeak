@@ -6,7 +6,7 @@ import aiohttp
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -103,14 +103,19 @@ async def notify(chat_id: int, text: str, btn_text: str = "Открыть при
         pass
 
 
-async def get_uid(x_tg_user_id: str = Header(default="")) -> int:
-    if not x_tg_user_id or not x_tg_user_id.isdigit():
+async def get_uid(
+    uid: Optional[str] = Query(default=None),
+    x_tg_user_id: str = Header(default="")
+) -> int:
+    # Принимаем uid из query параметра (?uid=123) или из заголовка
+    raw = uid or x_tg_user_id or ""
+    if not raw or not raw.isdigit():
         raise HTTPException(401, "Unauthorized")
-    uid = int(x_tg_user_id)
-    user = await db.get_user(uid)
+    user_id = int(raw)
+    user = await db.get_user(user_id)
     if not user:
-        await db.create_user(uid, "")
-    return uid
+        await db.create_user(user_id, "")
+    return user_id
 
 
 def nick_of(user) -> str:
