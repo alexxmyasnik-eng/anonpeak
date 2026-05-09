@@ -6,7 +6,8 @@ import aiohttp
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Depends, Query
+from fastapi import FastAPI, HTTPException, Header, Depends, Query, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -83,6 +84,27 @@ async def preflight_handler(rest_of_path: str, request: Request):
             "Access-Control-Max-Age": "3600",
         }
     )
+
+@app.middleware("http")
+async def parse_text_plain_as_json(request: Request, call_next):
+    """Позволяет принимать text/plain тело как JSON — обходит CORS preflight."""
+    ct = request.headers.get("content-type", "")
+    if request.method == "POST" and "text/plain" in ct:
+        try:
+            body = await request.body()
+            import json as _json
+            parsed = _json.loads(body)
+            async def new_body():
+                yield _json.dumps(parsed).encode()
+            request._body = body
+            # Патчим content-type чтобы FastAPI парсил как JSON
+            headers = dict(request.headers)
+            headers["content-type"] = "application/json"
+            from starlette.datastructures import Headers
+            request._headers = Headers(headers=headers)
+        except Exception:
+            pass
+    return await call_next(request)
 
 
 # ── HELPERS ───────────────────────────────────────────────
