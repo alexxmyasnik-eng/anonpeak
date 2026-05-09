@@ -85,26 +85,7 @@ async def preflight_handler(rest_of_path: str, request: Request):
         }
     )
 
-@app.middleware("http")
-async def parse_text_plain_as_json(request: Request, call_next):
-    """Позволяет принимать text/plain тело как JSON — обходит CORS preflight."""
-    ct = request.headers.get("content-type", "")
-    if request.method == "POST" and "text/plain" in ct:
-        try:
-            body = await request.body()
-            import json as _json
-            parsed = _json.loads(body)
-            async def new_body():
-                yield _json.dumps(parsed).encode()
-            request._body = body
-            # Патчим content-type чтобы FastAPI парсил как JSON
-            headers = dict(request.headers)
-            headers["content-type"] = "application/json"
-            from starlette.datastructures import Headers
-            request._headers = Headers(headers=headers)
-        except Exception:
-            pass
-    return await call_next(request)
+
 
 
 # ── HELPERS ───────────────────────────────────────────────
@@ -141,6 +122,18 @@ async def notify(chat_id: int, text: str, btn_text: str = "Открыть при
             )
     except Exception:
         pass
+
+
+async def _parse_body(request: Request) -> dict:
+    """Парсит тело запроса как JSON независимо от Content-Type."""
+    try:
+        body = await request.body()
+        if body:
+            import json as _json
+            return _json.loads(body)
+    except Exception:
+        pass
+    return {}
 
 
 async def get_uid(
@@ -260,19 +253,20 @@ class UpdateProfileReq(BaseModel):
 
 
 @app.post("/me/update")
-async def update_me(req: UpdateProfileReq, uid: int = Depends(get_uid)):
-    if not req.nickname or len(req.nickname) > 30:
+async def update_me(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    nickname = data.get("nickname", "")
+    age = int(data.get("age", 0))
+    gender = data.get("gender", "")
+    if not nickname or len(nickname) > 30:
         raise HTTPException(400, "Никнейм от 1 до 30 символов")
-    if req.age < 1 or req.age > 120:
+    if age < 1 or age > 120:
         raise HTTPException(400, "Укажи реальный возраст")
     u = await db.get_user(uid)
-    await db.update_profile(uid, req.nickname, req.age, u["avatar_id"] if u else None)
+    await db.update_profile(uid, nickname, age, u["avatar_id"] if u else None)
     try:
         async with aiosqlite.connect(DB_PATH) as d:
-            await d.execute(
-                "UPDATE users SET gender=? WHERE user_id=?",
-                (req.gender or "", uid)
-            )
+            await d.execute("UPDATE users SET gender=? WHERE user_id=?", (gender, uid))
             await d.commit()
     except Exception:
         pass
@@ -335,14 +329,16 @@ class SendMsgReq(BaseModel):
 
 
 @app.post("/orders/{order_id}/messages")
-async def send_message(order_id: int, req: SendMsgReq, uid: int = Depends(get_uid)):
-    if not req.text or not req.text.strip():
+async def send_message(order_id: int, request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    text = data.get("text", "")
+    if not text or not text.strip():
         raise HTTPException(400, "Пустое сообщение")
     order = await db.get_order(order_id)
     if not order or uid not in (order["buyer_id"], order["seller_id"]):
         raise HTTPException(403, "Нет доступа")
     partner_id = order["seller_id"] if order["buyer_id"] == uid else order["buyer_id"]
-    await db.send_msg(order_id, uid, partner_id, text=req.text.strip())
+    await db.send_msg(order_id, uid, partner_id, text=text.strip())
     me = await db.get_user(uid)
     short = order["short_id"] or f"#{order_id}"
     asyncio.create_task(notify(
@@ -359,8 +355,9 @@ class BuyReq(BaseModel):
 
 
 @app.post("/buy")
-async def buy_product(req: BuyReq, uid: int = Depends(get_uid)):
-    p = await db.get_product(req.product_id)
+async def buy_product(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    p = await db.get_product(data.get("product_id"))
     if not p or p["status"] != "active":
         raise HTTPException(400, "Товар недоступен")
     if p["seller_id"] == uid:
@@ -396,8 +393,9 @@ class ConfirmReq(BaseModel):
 
 
 @app.post("/confirm_order")
-async def confirm_order(req: ConfirmReq, uid: int = Depends(get_uid)):
-    order = await db.get_order(req.order_id)
+async def confirm_order(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    order = await db.get_order(data.get("order_id"))
     if not order or order["buyer_id"] != uid:
         raise HTTPException(403, "Нет доступа")
     if order["status"] not in ("paid", "seller_confirmed"):
@@ -413,12 +411,14 @@ class TopupReq(BaseModel):
 
 
 @app.post("/topup/create")
-async def topup_create(req: TopupReq, uid: int = Depends(get_uid)):
-    if req.amount < 10:
+async def topup_create(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    amount = int(data.get("amount", 0))
+    if amount < 10:
         raise HTTPException(400, "Минимум 10 ₽")
     code = gen_code()
-    topup_id = await db.create_topup(uid, req.amount, code)
-    return {"topup_id": topup_id, "code": code, "da_link": DA_LINK, "amount": req.amount}
+    topup_id = await db.create_topup(uid, amount, code)
+    return {"topup_id": topup_id, "code": code, "da_link": DA_LINK, "amount": amount}
 
 
 class CreateProductReq(BaseModel):
@@ -430,38 +430,35 @@ class CreateProductReq(BaseModel):
 
 
 @app.post("/products/create")
-async def create_product(req: CreateProductReq, uid: int = Depends(get_uid)):
-    if req.category not in CATEGORIES:
+async def create_product(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    category = data.get("category", "")
+    title = data.get("title", "")
+    description = data.get("description", "")
+    price = float(data.get("price", 0))
+    is_premium = bool(data.get("is_premium", False))
+    if category not in CATEGORIES:
         raise HTTPException(400, "Неверная категория")
-    if not req.title or len(req.title) > 100:
+    if not title or len(title) > 100:
         raise HTTPException(400, "Название от 1 до 100 символов")
-    if req.price < MIN_PRICE:
+    if price < MIN_PRICE:
         raise HTTPException(400, f"Минимальная цена {MIN_PRICE} ₽")
-    if req.is_premium:
+    if is_premium:
         balance = await db.get_balance(uid)
         if balance < PREMIUM_PRICE:
-            raise HTTPException(
-                400,
-                f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). "
-                f"Баланс: {balance:.0f} ₽"
-            )
+            raise HTTPException(400, f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). Баланс: {balance:.0f} ₽")
         await db.change_balance(uid, -PREMIUM_PRICE)
-    product_id = await db.add_product(
-        uid, req.category, req.title,
-        req.description or "", req.price, None, None
-    )
-    if req.is_premium:
+    product_id = await db.add_product(uid, category, title, description or "", price, None, None)
+    if is_premium:
         try:
             from datetime import datetime
             async with aiosqlite.connect(DB_PATH) as d:
-                await d.execute(
-                    "UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
-                    (datetime.now().isoformat(), product_id)
-                )
+                await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
+                    (datetime.now().isoformat(), product_id))
                 await d.commit()
         except Exception:
             pass
-    seller_gets = round(req.price * (1 - SELL_COMM), 2)
+    seller_gets = round(price * (1 - SELL_COMM), 2)
     return {"ok": True, "product_id": product_id, "seller_gets": seller_gets}
 
 
@@ -471,18 +468,21 @@ class WithdrawReq(BaseModel):
 
 
 @app.post("/withdraw")
-async def withdraw(req: WithdrawReq, uid: int = Depends(get_uid)):
-    if req.amount < MIN_WITHDRAW:
+async def withdraw(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    amount = float(data.get("amount", 0))
+    username = data.get("username", "")
+    if amount < MIN_WITHDRAW:
         raise HTTPException(400, f"Минимум {MIN_WITHDRAW} ₽")
-    if not req.username or not req.username.startswith("@") or len(req.username) < 2:
+    if not username or not username.startswith("@") or len(username) < 2:
         raise HTTPException(400, "Укажи @username")
     balance = await db.get_balance(uid)
-    if balance < req.amount:
+    if balance < amount:
         raise HTTPException(400, f"Недостаточно средств. Баланс: {balance:.0f} ₽")
-    after = round(req.amount * (1 - WITHDRAW_COMM), 2)
+    after = round(amount * (1 - WITHDRAW_COMM), 2)
     stars = math.ceil(after / STAR_RATE)
-    await db.change_balance(uid, -req.amount)
-    w_id = await db.create_withdrawal(uid, req.amount)
+    await db.change_balance(uid, -amount)
+    w_id = await db.create_withdrawal(uid, amount)
     u = await db.get_user(uid)
     asyncio.create_task(notify(
         ADMIN_ID,
@@ -492,7 +492,7 @@ async def withdraw(req: WithdrawReq, uid: int = Depends(get_uid)):
         f"📱 Username: {req.username}",
         "OK"
     ))
-    return {"ok": True, "w_id": w_id, "after_commission": after, "stars": stars}
+    return {"ok": True, "w_id": w_id, "after_commission": after, "stars": stars, "amount": amount}
 
 
 class SupportReq(BaseModel):
@@ -500,10 +500,12 @@ class SupportReq(BaseModel):
 
 
 @app.post("/support")
-async def support(req: SupportReq, uid: int = Depends(get_uid)):
-    if not req.message or not req.message.strip():
+async def support(request: Request, uid: int = Depends(get_uid)):
+    data = await _parse_body(request)
+    msg = data.get("message", "")
+    if not msg or not msg.strip():
         raise HTTPException(400, "Пустое сообщение")
-    ticket_id = await db.create_support_ticket(uid, req.message.strip())
+    ticket_id = await db.create_support_ticket(uid, msg.strip())
     u = await db.get_user(uid)
     asyncio.create_task(notify(
         ADMIN_ID,
