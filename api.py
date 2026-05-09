@@ -1,10 +1,10 @@
-import json
+import json, aiosqlite
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from urllib.parse import unquote
+from typing import Optional
 import database as db
-from config import BOT_COMMISSION, DA_LINK, ADMIN_ID
+from config import BOT_COMMISSION, DA_LINK, ADMIN_ID, BOT_TOKEN, DB_PATH, MIN_PRICE
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -46,12 +46,12 @@ async def get_products(category: str):
         seller = await db.get_user(p["seller_id"])
         avg, _ = await db.get_seller_rating(p["seller_id"])
         result.append({
-            "id": p["id"], "title": p["title"], "description": p["description"],
-            "price": p["price"], "category": p["category"],
-            "media_id": p["media_id"], "media_type": p["media_type"],
-            "seller_id": p["seller_id"],
-            "seller_nick": seller["nickname"] if seller else "?",
-            "seller_rating": avg,
+            "id": p["id"], "title": p["title"],
+            "description": p["description"], "price": p["price"],
+            "category": p["category"], "media_id": p["media_id"],
+            "media_type": p["media_type"], "seller_id": p["seller_id"],
+            "seller_nick": seller["nickname"] if seller and seller["nickname"] else "Аноним",
+            "seller_rating": round(avg, 1),
         })
     return result
 
@@ -62,12 +62,12 @@ async def get_product(product_id: int):
     seller = await db.get_user(p["seller_id"])
     avg, cnt = await db.get_seller_rating(p["seller_id"])
     return {
-        "id": p["id"], "title": p["title"], "description": p["description"],
-        "price": p["price"], "category": p["category"],
-        "media_id": p["media_id"], "media_type": p["media_type"],
-        "seller_id": p["seller_id"],
-        "seller_nick": seller["nickname"] if seller else "?",
-        "seller_rating": avg, "seller_reviews": cnt,
+        "id": p["id"], "title": p["title"],
+        "description": p["description"], "price": p["price"],
+        "category": p["category"], "media_id": p["media_id"],
+        "media_type": p["media_type"], "seller_id": p["seller_id"],
+        "seller_nick": seller["nickname"] if seller and seller["nickname"] else "Аноним",
+        "seller_rating": round(avg, 1), "seller_reviews": cnt,
     }
 
 # ── AUTH REQUIRED ─────────────────────────────────────────
@@ -77,8 +77,6 @@ async def get_me(uid: int = Depends(get_uid)):
     u = await db.get_user(uid)
     gender = ""
     try:
-        import aiosqlite
-        from config import DB_PATH
         async with aiosqlite.connect(DB_PATH) as d:
             async with d.execute("SELECT gender FROM users WHERE user_id=?", (uid,)) as c:
                 row = await c.fetchone()
@@ -86,18 +84,21 @@ async def get_me(uid: int = Depends(get_uid)):
     except Exception:
         pass
     return {
-        "uid": uid, "nickname": u["nickname"], "age": u["age"],
-        "balance": float(u["balance"]), "avatar_id": u["avatar_id"],
+        "uid": uid,
+        "nickname": u["nickname"] if u else "",
+        "age": u["age"] if u else None,
+        "balance": float(u["balance"]) if u else 0.0,
+        "avatar_id": u["avatar_id"] if u else None,
         "gender": gender,
     }
 
 class UpdateProfileRequest(BaseModel):
     nickname: str
     age: int
-    gender: str = ""
+    gender: Optional[str] = ""
 
 @app.post("/me/update")
-async def update_profile(req: UpdateProfileRequest, uid: int = Depends(get_uid)):
+async def update_me(req: UpdateProfileRequest, uid: int = Depends(get_uid)):
     if not req.nickname or len(req.nickname) > 30:
         raise HTTPException(400, "Никнейм от 1 до 30 символов")
     if req.age < 1 or req.age > 120:
@@ -105,14 +106,13 @@ async def update_profile(req: UpdateProfileRequest, uid: int = Depends(get_uid))
     u = await db.get_user(uid)
     await db.update_profile(uid, req.nickname, req.age, u["avatar_id"] if u else None)
     try:
-        import aiosqlite
-        from config import DB_PATH
         async with aiosqlite.connect(DB_PATH) as d:
+            # Добавляем колонку если нет
             try:
-                await d.execute("ALTER TABLE users ADD COLUMN gender TEXT")
+                await d.execute("ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''")
             except Exception:
                 pass
-            await d.execute("UPDATE users SET gender=? WHERE user_id=?", (req.gender, uid))
+            await d.execute("UPDATE users SET gender=? WHERE user_id=?", (req.gender or "", uid))
             await d.commit()
     except Exception:
         pass
@@ -127,12 +127,14 @@ async def get_orders(uid: int = Depends(get_uid)):
         partner = await db.get_user(partner_id)
         p = await db.get_product(o["product_id"])
         result.append({
-            "id": o["id"], "short_id": o["short_id"] or f"#{o['id']}",
-            "product_title": p["title"] if p else "?",
+            "id": o["id"],
+            "short_id": o["short_id"] or f"#{o['id']}",
+            "product_title": p["title"] if p else "Товар удалён",
             "amount": o["amount"], "status": o["status"],
             "buyer_id": o["buyer_id"], "seller_id": o["seller_id"],
-            "partner_nick": partner["nickname"] if partner else "?",
+            "partner_nick": partner["nickname"] if partner and partner["nickname"] else "Аноним",
             "role": "buyer" if o["buyer_id"] == uid else "seller",
+            "commission": o["commission"],
         })
     return result
 
@@ -140,7 +142,7 @@ async def get_orders(uid: int = Depends(get_uid)):
 async def get_messages(order_id: int, uid: int = Depends(get_uid)):
     order = await db.get_order(order_id)
     if not order or uid not in (order["buyer_id"], order["seller_id"]):
-        raise HTTPException(403, "No access")
+        raise HTTPException(403, "Нет доступа")
     await db.mark_read(order_id, uid)
     msgs = await db.get_order_messages(order_id)
     return [{"id": m["id"], "sender_id": m["sender_id"], "text": m["text"],
@@ -151,11 +153,13 @@ class SendMsgRequest(BaseModel):
 
 @app.post("/orders/{order_id}/messages")
 async def send_message(order_id: int, req: SendMsgRequest, uid: int = Depends(get_uid)):
+    if not req.text or not req.text.strip():
+        raise HTTPException(400, "Пустое сообщение")
     order = await db.get_order(order_id)
     if not order or uid not in (order["buyer_id"], order["seller_id"]):
-        raise HTTPException(403, "No access")
+        raise HTTPException(403, "Нет доступа")
     partner_id = order["seller_id"] if order["buyer_id"] == uid else order["buyer_id"]
-    await db.send_msg(order_id, uid, partner_id, text=req.text)
+    await db.send_msg(order_id, uid, partner_id, text=req.text.strip())
     return {"ok": True}
 
 class BuyRequest(BaseModel):
@@ -185,24 +189,37 @@ class ConfirmOrderRequest(BaseModel):
 async def confirm_order(req: ConfirmOrderRequest, uid: int = Depends(get_uid)):
     order = await db.get_order(req.order_id)
     if not order or order["buyer_id"] != uid:
-        raise HTTPException(403, "No access")
+        raise HTTPException(403, "Нет доступа")
     if order["status"] not in ("paid", "seller_confirmed"):
-        raise HTTPException(400, "Wrong status")
+        raise HTTPException(400, "Нельзя закрыть этот заказ")
     seller_gets = round(order["amount"] - order["commission"], 2)
     await db.change_balance(order["seller_id"], seller_gets)
     await db.update_order_status(req.order_id, "done")
     return {"ok": True}
 
-@app.get("/topup/init/{amount}")
-async def topup_init(amount: int, uid: int = Depends(get_uid)):
-    if amount < 10: raise HTTPException(400, "Min 10")
-    da_comment = f"Топап {uid} {amount}"
-    topup_id = await db.create_topup(uid, amount, da_comment)
-    return {"topup_id": topup_id, "da_comment": da_comment, "da_link": DA_LINK, "amount": amount}
+class TopupRequest(BaseModel):
+    amount: int
+
+@app.post("/topup/create")
+async def topup_create(req: TopupRequest, uid: int = Depends(get_uid)):
+    if req.amount < 10:
+        raise HTTPException(400, "Минимум 10 ₽")
+    # Генерируем красивый код
+    import random, string
+    chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    code = ''.join(random.choices(chars, k=4)) + '-' + ''.join(random.choices(chars, k=4))
+    da_comment = code
+    topup_id = await db.create_topup(uid, req.amount, da_comment)
+    return {
+        "topup_id": topup_id,
+        "code": code,
+        "da_link": DA_LINK,
+        "amount": req.amount
+    }
 
 class CreateProductRequest(BaseModel):
     title: str
-    description: str
+    description: Optional[str] = ""
     price: float
     category: str
 
@@ -212,10 +229,13 @@ async def create_product(req: CreateProductRequest, uid: int = Depends(get_uid))
         raise HTTPException(400, "Неверная категория")
     if not req.title or len(req.title) > 100:
         raise HTTPException(400, "Название от 1 до 100 символов")
-    from config import MIN_PRICE
     if req.price < MIN_PRICE:
         raise HTTPException(400, f"Минимальная цена {MIN_PRICE} ₽")
-    product_id = await db.create_product(uid, req.title, req.description, req.price, req.category)
+    # Правильное имя функции в database.py — add_product
+    product_id = await db.add_product(
+        uid, req.category, req.title,
+        req.description or "", req.price, None, None
+    )
     return {"ok": True, "product_id": product_id}
 
 class SupportRequest(BaseModel):
@@ -223,17 +243,21 @@ class SupportRequest(BaseModel):
 
 @app.post("/support")
 async def support(req: SupportRequest, uid: int = Depends(get_uid)):
-    ticket_id = await db.create_support_ticket(uid, req.message)
-    # Уведомляем админа через бота
+    if not req.message or not req.message.strip():
+        raise HTTPException(400, "Пустое сообщение")
+    ticket_id = await db.create_support_ticket(uid, req.message.strip())
     try:
         import aiohttp
         u = await db.get_user(uid)
         nick = u["nickname"] if u and u["nickname"] else f"ID:{uid}"
-        from config import BOT_TOKEN
         async with aiohttp.ClientSession() as s:
             await s.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": ADMIN_ID, "text": f"🆘 Поддержка #{ticket_id}\n👤 {nick} (ID:{uid})\n\n{req.message}"}
+                json={
+                    "chat_id": ADMIN_ID,
+                    "text": f"🆘 <b>Поддержка #{ticket_id}</b>\n👤 {nick} (ID:{uid})\n\n{req.message.strip()}",
+                    "parse_mode": "HTML"
+                }
             )
     except Exception:
         pass
