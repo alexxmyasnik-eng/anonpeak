@@ -90,6 +90,30 @@ async def get_categories():
     return [{"id":k,"name":v} for k,v in CATEGORIES.items()]
 
 # ── PRODUCTS ─────────────────────────────────────────────
+@app.get("/products/create")
+async def create_product(
+    uid: int = Query(...), title: str = Query(...),
+    description: str = Query(default=""), price: float = Query(...),
+    category: str = Query(...), is_premium: bool = Query(default=False)
+):
+    if category not in CATEGORIES: raise HTTPException(400,"Неверная категория")
+    if not title or len(title)>100: raise HTTPException(400,"Название от 1 до 100 символов")
+    if price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
+    if is_premium:
+        balance = await db.get_balance(uid)
+        if balance<PREMIUM_PRICE:
+            raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). Баланс: {balance:.0f} ₽")
+        await db.change_balance(uid,-PREMIUM_PRICE)
+    product_id = await db.add_product(uid,category,title,description or "",price,None,None)
+    if is_premium:
+        try:
+            async with aiosqlite.connect(DB_PATH) as d:
+                await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
+                    (datetime.now().isoformat(),product_id))
+                await d.commit()
+        except: pass
+    return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
+
 @app.get("/products/{category}")
 async def get_products(category: str):
     if category not in CATEGORIES: raise HTTPException(404,"Не найдено")
@@ -241,30 +265,6 @@ async def topup_create(amount: int = Query(...), uid: int = Query(...)):
     topup_id = await db.create_topup(uid,amount,code)
     return {"topup_id":topup_id,"code":code,"da_link":DA_LINK,"amount":amount}
 
-@app.get("/products/create")
-async def create_product(
-    uid: int = Query(...), title: str = Query(...),
-    description: str = Query(default=""), price: float = Query(...),
-    category: str = Query(...), is_premium: bool = Query(default=False)
-):
-    if category not in CATEGORIES: raise HTTPException(400,"Неверная категория")
-    if not title or len(title)>100: raise HTTPException(400,"Название от 1 до 100 символов")
-    if price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
-    if is_premium:
-        balance = await db.get_balance(uid)
-        if balance<PREMIUM_PRICE:
-            raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). Баланс: {balance:.0f} ₽")
-        await db.change_balance(uid,-PREMIUM_PRICE)
-    product_id = await db.add_product(uid,category,title,description or "",price,None,None)
-    if is_premium:
-        try:
-            async with aiosqlite.connect(DB_PATH) as d:
-                await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
-                    (datetime.now().isoformat(),product_id))
-                await d.commit()
-        except: pass
-    return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
-
 @app.get("/withdraw")
 async def withdraw(
     uid: int = Query(...), amount: float = Query(...), username: str = Query(...)
@@ -297,3 +297,57 @@ async def support(uid: int = Query(...), message: str = Query(...)):
     except Exception:
         pass
     return {"ok": True, "ticket_id": ticket_id}
+
+
+# ── GLOBAL CHAT ───────────────────────────────────────────
+
+@app.get("/chat/messages")
+async def chat_messages(limit: int = Query(default=50)):
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            d.row_factory = aiosqlite.Row
+            try:
+                await d.execute("CREATE TABLE IF NOT EXISTS global_chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, nickname TEXT, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                await d.commit()
+            except: pass
+            async with d.execute(
+                "SELECT * FROM global_chat ORDER BY created_at DESC LIMIT ?", (limit,)
+            ) as c:
+                rows = await c.fetchall()
+        return [{"id":r["id"],"user_id":r["user_id"],"nickname":r["nickname"],
+                 "message":r["message"],"created_at":str(r["created_at"])} for r in reversed(rows)]
+    except Exception as e:
+        return []
+
+@app.get("/chat/send")
+async def chat_send(uid: int = Query(...), message: str = Query(...)):
+    if not message.strip(): raise HTTPException(400,"Пустое сообщение")
+    if len(message) > 500: raise HTTPException(400,"Максимум 500 символов")
+    u = await db.get_user(uid)
+    nickname = nick_of(u)
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            try:
+                await d.execute("CREATE TABLE IF NOT EXISTS global_chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, nickname TEXT, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            except: pass
+            await d.execute(
+                "INSERT INTO global_chat (user_id, nickname, message) VALUES (?,?,?)",
+                (uid, nickname, message.strip())
+            )
+            await d.commit()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+@app.get("/chat/delete")
+async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT user_id FROM global_chat WHERE id=?", (msg_id,)) as c:
+            row = await c.fetchone()
+        if not row: raise HTTPException(404,"Сообщение не найдено")
+        # Удалять может только автор
+        if row["user_id"] != uid: raise HTTPException(403,"Нет доступа")
+        await d.execute("DELETE FROM global_chat WHERE id=?", (msg_id,))
+        await d.commit()
+    return {"ok": True}
