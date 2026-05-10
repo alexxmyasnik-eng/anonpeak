@@ -1,4 +1,9 @@
 import random, string, math, aiosqlite, asyncio, json
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -56,16 +61,16 @@ def gen_code():
 def nick_of(u): return (u["nickname"] if u and u["nickname"] else "Аноним")
 
 async def notify(chat_id, text):
-    if not BOT_TOKEN or not chat_id: return
+    if not BOT_TOKEN or not chat_id or not HAS_AIOHTTP: return
     try:
-        import aiohttp
         async with aiohttp.ClientSession() as s:
             await asyncio.wait_for(s.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={"chat_id":chat_id,"text":text,"parse_mode":"HTML",
                       "reply_markup":{"inline_keyboard":[[{"text":"Открыть","web_app":{"url":"https://alexxmyasnik-eng.github.io/anonminiapp"}}]]}}
             ), timeout=5)
-    except: pass
+    except Exception:
+        pass
 
 async def require_uid(uid: Optional[str] = Query(default=None)) -> int:
     if not uid or not uid.isdigit():
@@ -281,8 +286,17 @@ async def withdraw(
 @app.get("/support")
 async def support(uid: int = Query(...), message: str = Query(...)):
     if not message.strip(): raise HTTPException(400,"Пустое сообщение")
-    ticket_id = await db.create_support_ticket(uid,message.strip())
-    u = await db.get_user(uid)
-    asyncio.create_task(notify(ADMIN_ID,
-        f"🆘 <b>Поддержка #{ticket_id}</b>\n👤 {nick_of(u)} (ID:{uid})\n\n{message.strip()}"))
-    return {"ok":True,"ticket_id":ticket_id}
+    try:
+        ticket_id = await db.create_support_ticket(uid, message.strip())
+    except Exception as e:
+        raise HTTPException(500, f"DB error: {e}")
+    try:
+        u = await db.get_user(uid)
+        await notify(ADMIN_ID,
+            f"🆘 Поддержка #{ticket_id}
+👤 {nick_of(u)} (ID:{uid})
+
+{message.strip()}")
+    except Exception:
+        pass
+    return {"ok": True, "ticket_id": ticket_id}
