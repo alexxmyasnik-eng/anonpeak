@@ -32,6 +32,7 @@ async def init_db():
 
         CREATE TABLE IF NOT EXISTS orders (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            short_id     TEXT UNIQUE,
             buyer_id     INTEGER,
             seller_id    INTEGER,
             product_id   INTEGER,
@@ -90,6 +91,13 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS used_donation_ids (
             donation_id  INTEGER PRIMARY KEY,
             used_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER NOT NULL,
+            message      TEXT NOT NULL,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
         await db.commit()
@@ -185,11 +193,22 @@ async def delete_product(product_id: int, seller_id: int):
 
 # ─── ORDERS ──────────────────────────────────────────────
 
+async def _gen_short_id(db) -> str:
+    import random, string
+    chars = string.ascii_uppercase + string.digits
+    for _ in range(20):
+        sid = ''.join(random.choices(chars, k=6))
+        async with db.execute("SELECT id FROM orders WHERE short_id=?", (sid,)) as c:
+            if not await c.fetchone():
+                return sid
+    return ''.join(random.choices(chars, k=8))
+
 async def create_order(buyer_id, seller_id, product_id, amount, commission, da_comment=""):
     async with aiosqlite.connect(DB_PATH) as db:
+        short_id = await _gen_short_id(db)
         c = await db.execute(
-            "INSERT INTO orders (buyer_id,seller_id,product_id,amount,commission,da_comment) VALUES (?,?,?,?,?,?)",
-            (buyer_id, seller_id, product_id, amount, commission, da_comment)
+            "INSERT INTO orders (short_id,buyer_id,seller_id,product_id,amount,commission,da_comment) VALUES (?,?,?,?,?,?,?)",
+            (short_id, buyer_id, seller_id, product_id, amount, commission, da_comment)
         )
         await db.commit()
         return c.lastrowid
@@ -397,3 +416,14 @@ async def is_donation_used(donation_id: int) -> bool:
             "SELECT 1 FROM used_donation_ids WHERE donation_id=?", (donation_id,)
         ) as c:
             return (await c.fetchone()) is not None
+
+# ─── SUPPORT ─────────────────────────────────────────────
+
+async def create_support_ticket(user_id: int, message: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        c = await db.execute(
+            "INSERT INTO support_tickets (user_id, message) VALUES (?,?)",
+            (user_id, message)
+        )
+        await db.commit()
+        return c.lastrowid
