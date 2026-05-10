@@ -293,10 +293,7 @@ async def support(uid: int = Query(...), message: str = Query(...)):
     try:
         u = await db.get_user(uid)
         await notify(ADMIN_ID,
-            f"🆘 Поддержка #{ticket_id}
-👤 {nick_of(u)} (ID:{uid})
-
-{message.strip()}")
+            f"[SUPPORT #{ticket_id}] {nick_of(u)} (ID:{uid}) - {message.strip()}")
     except Exception:
         pass
     return {"ok": True, "ticket_id": ticket_id}
