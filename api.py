@@ -35,8 +35,21 @@ async def migrate():
     async with aiosqlite.connect(DB_PATH) as d:
         for sql in [
             "ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN earn_balance REAL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''",
             "ALTER TABLE products ADD COLUMN is_premium INTEGER DEFAULT 0",
             "ALTER TABLE products ADD COLUMN premium_at TIMESTAMP",
+            """CREATE TABLE IF NOT EXISTS global_chat (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, nickname TEXT, message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            """CREATE TABLE IF NOT EXISTS support_chat (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, from_admin INTEGER DEFAULT 0,
+                message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
         ]:
             try: await d.execute(sql)
             except: pass
@@ -160,8 +173,23 @@ async def get_me(uid: int = Query(...)):
                 row = await c.fetchone()
                 if row and row[0]: gender = row[0]
     except: pass
+    earn_bal = 0.0
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            async with d.execute("SELECT earn_balance FROM users WHERE user_id=?",(uid,)) as c:
+                row = await c.fetchone()
+                if row and row[0]: earn_bal = float(row[0])
+    except: pass
+    avatar_url = ""
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            async with d.execute("SELECT avatar_url FROM users WHERE user_id=?",(uid,)) as c:
+                row = await c.fetchone()
+                if row and row[0]: avatar_url = row[0]
+    except: pass
     return {"uid":uid,"nickname":u["nickname"] if u else "",
             "age":u["age"] if u else None,"balance":float(u["balance"]) if u else 0.0,
+            "earn_balance":earn_bal,"avatar_url":avatar_url,
             "avatar_id":u["avatar_id"] if u else None,"gender":gender}
 
 @app.get("/me/update")
@@ -300,6 +328,72 @@ async def support(uid: int = Query(...), message: str = Query(...)):
 
 
 # ── GLOBAL CHAT ───────────────────────────────────────────
+
+@app.get("/me/set_avatar")
+async def set_avatar(uid: int = Query(...), avatar_url: str = Query(...)):
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
+            except: pass
+            await d.execute("UPDATE users SET avatar_url=? WHERE user_id=?", (avatar_url, uid))
+            await d.commit()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
+@app.get("/user/{user_id}")
+async def get_user_profile(user_id: int):
+    u = await db.get_user(user_id)
+    if not u: raise HTTPException(404, "Не найден")
+    avg, cnt = await db.get_seller_rating(user_id)
+    gender = ""
+    avatar_url = ""
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            async with d.execute("SELECT gender, avatar_url FROM users WHERE user_id=?",(user_id,)) as c:
+                row = await c.fetchone()
+                if row: gender, avatar_url = row[0] or "", row[1] or ""
+    except: pass
+    return {
+        "uid": user_id, "nickname": u["nickname"] or "Аноним",
+        "age": u["age"], "gender": gender, "avatar_url": avatar_url,
+        "rating": round(avg,1), "reviews": cnt,
+    }
+
+# ── SUPPORT CHAT ──────────────────────────────────────────
+
+@app.get("/support/messages")
+async def support_messages(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT * FROM support_chat WHERE user_id=? ORDER BY created_at ASC LIMIT 100",(uid,)
+        ) as c: rows = await c.fetchall()
+    return [{"id":r["id"],"from_admin":bool(r["from_admin"]),
+             "message":r["message"],"created_at":str(r["created_at"])} for r in rows]
+
+@app.get("/support/send")
+async def support_send(uid: int = Query(...), message: str = Query(...)):
+    if not message.strip(): raise HTTPException(400,"Пустое")
+    async with aiosqlite.connect(DB_PATH) as d:
+        await d.execute("INSERT INTO support_chat (user_id,from_admin,message) VALUES (?,0,?)",
+            (uid, message.strip()))
+        await d.commit()
+    u = await db.get_user(uid)
+    asyncio.ensure_future(notify(ADMIN_ID,
+        f"[SUPPORT] {nick_of(u)} (ID:{uid}): {message.strip()[:100]}"))
+    return {"ok": True}
+
+@app.get("/support/reply")
+async def support_reply(admin_id: int = Query(...), user_id: int = Query(...), message: str = Query(...)):
+    if admin_id != ADMIN_ID: raise HTTPException(403,"Нет доступа")
+    async with aiosqlite.connect(DB_PATH) as d:
+        await d.execute("INSERT INTO support_chat (user_id,from_admin,message) VALUES (?,1,?)",
+            (user_id, message.strip()))
+        await d.commit()
+    asyncio.ensure_future(notify(user_id,
+        f"[Поддержка] Ответ: {message.strip()[:100]}"))
+    return {"ok": True}
 
 @app.get("/chat/messages")
 async def chat_messages(limit: int = Query(default=50)):
