@@ -50,6 +50,17 @@ async def migrate():
                 message TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""",
+            """CREATE TABLE IF NOT EXISTS friends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, friend_id INTEGER,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, friend_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS muted_users (
+                user_id INTEGER, muted_id INTEGER,
+                PRIMARY KEY(user_id, muted_id)
+            )""",
         ]:
             try: await d.execute(sql)
             except: pass
@@ -329,8 +340,23 @@ async def support(uid: int = Query(...), message: str = Query(...)):
 
 # ── GLOBAL CHAT ───────────────────────────────────────────
 
+@app.post("/me/set_avatar")
+async def set_avatar_post(request: Request, uid: int = Query(...)):
+    """Принимает base64 аватарку через POST body."""
+    try:
+        body = await request.body()
+        avatar_data = body.decode('utf-8')[:500000]  # max 500kb
+        async with aiosqlite.connect(DB_PATH) as d:
+            try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
+            except: pass
+            await d.execute("UPDATE users SET avatar_url=? WHERE user_id=?", (avatar_data, uid))
+            await d.commit()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    return {"ok": True}
+
 @app.get("/me/set_avatar")
-async def set_avatar(uid: int = Query(...), avatar_url: str = Query(...)):
+async def set_avatar(uid: int = Query(...), avatar_url: str = Query(default="")):
     try:
         async with aiosqlite.connect(DB_PATH) as d:
             try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
@@ -385,15 +411,103 @@ async def support_send(uid: int = Query(...), message: str = Query(...)):
     return {"ok": True}
 
 @app.get("/support/reply")
-async def support_reply(admin_id: int = Query(...), user_id: int = Query(...), message: str = Query(...)):
-    if admin_id != ADMIN_ID: raise HTTPException(403,"Нет доступа")
+async def support_reply(uid: int = Query(...), user_id: int = Query(...), message: str = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403,"Нет доступа")
+    if not message.strip(): raise HTTPException(400,"Пустое")
     async with aiosqlite.connect(DB_PATH) as d:
         await d.execute("INSERT INTO support_chat (user_id,from_admin,message) VALUES (?,1,?)",
             (user_id, message.strip()))
         await d.commit()
-    asyncio.ensure_future(notify(user_id,
-        f"[Поддержка] Ответ: {message.strip()[:100]}"))
+    asyncio.ensure_future(notify(user_id, f"[Поддержка] {message.strip()[:100]}"))
     return {"ok": True}
+
+@app.get("/support/tickets")
+async def support_tickets(uid: int = Query(...)):
+    """Список всех тикетов для админа."""
+    if uid != ADMIN_ID: raise HTTPException(403,"Нет доступа")
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT DISTINCT user_id FROM support_chat WHERE from_admin=0 ORDER BY MAX(created_at) DESC"
+        ) as c: rows = await c.fetchall()
+    result = []
+    for r in rows:
+        u = await db.get_user(r["user_id"])
+        async with aiosqlite.connect(DB_PATH) as d:
+            d.row_factory = aiosqlite.Row
+            async with d.execute(
+                "SELECT message,created_at FROM support_chat WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+                (r["user_id"],)
+            ) as c: last = await c.fetchone()
+        result.append({
+            "user_id": r["user_id"],
+            "nickname": nick_of(u),
+            "last_message": last["message"] if last else "",
+            "last_time": str(last["created_at"]) if last else "",
+        })
+    return result
+
+# ── FRIENDS ───────────────────────────────────────────────
+
+@app.get("/friends/add")
+async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
+    if uid == friend_id: raise HTTPException(400,"Нельзя добавить себя")
+    async with aiosqlite.connect(DB_PATH) as d:
+        try:
+            await d.execute("INSERT INTO friends (user_id,friend_id,status) VALUES (?,?,'pending')",(uid,friend_id))
+            await d.commit()
+        except: pass
+    u = await db.get_user(uid)
+    asyncio.ensure_future(notify(friend_id, f"[Заявка] {nick_of(u)} хочет добавить вас в друзья"))
+    return {"ok": True}
+
+@app.get("/friends/accept")
+async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        await d.execute("UPDATE friends SET status='accepted' WHERE user_id=? AND friend_id=?",(friend_id,uid))
+        try:
+            await d.execute("INSERT INTO friends (user_id,friend_id,status) VALUES (?,?,'accepted')",(uid,friend_id))
+        except:
+            await d.execute("UPDATE friends SET status='accepted' WHERE user_id=? AND friend_id=?",(uid,friend_id))
+        await d.commit()
+    u = await db.get_user(uid)
+    asyncio.ensure_future(notify(friend_id, f"[Друзья] {nick_of(u)} принял вашу заявку"))
+    return {"ok": True}
+
+@app.get("/friends/list")
+async def friends_list(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT friend_id,status FROM friends WHERE user_id=?",(uid,)
+        ) as c: rows = await c.fetchall()
+    result = []
+    for r in rows:
+        u = await db.get_user(r["friend_id"])
+        result.append({"friend_id":r["friend_id"],"nickname":nick_of(u),"status":r["status"]})
+    return result
+
+@app.get("/friends/requests")
+async def friend_requests(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT user_id FROM friends WHERE friend_id=? AND status='pending'",(uid,)
+        ) as c: rows = await c.fetchall()
+    result = []
+    for r in rows:
+        u = await db.get_user(r["user_id"])
+        result.append({"user_id":r["user_id"],"nickname":nick_of(u)})
+    return result
+
+@app.get("/friends/status")
+async def friend_status(uid: int = Query(...), other_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT status FROM friends WHERE user_id=? AND friend_id=?",(uid,other_id)
+        ) as c: row = await c.fetchone()
+    return {"status": row["status"] if row else "none"}
 
 @app.get("/chat/messages")
 async def chat_messages(limit: int = Query(default=50)):
