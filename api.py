@@ -345,7 +345,7 @@ async def set_avatar_post(request: Request, uid: int = Query(...)):
     """Принимает base64 аватарку через POST body."""
     try:
         body = await request.body()
-        avatar_data = body.decode('utf-8')[:500000]  # max 500kb
+        avatar_data = body.decode('utf-8')[:15000000]  # max 10mb base64
         async with aiosqlite.connect(DB_PATH) as d:
             try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
             except: pass
@@ -425,27 +425,26 @@ async def support_reply(uid: int = Query(...), user_id: int = Query(...), messag
 async def support_tickets(uid: int = Query(...)):
     """Список всех тикетов для админа."""
     if uid != ADMIN_ID: raise HTTPException(403,"Нет доступа")
-    async with aiosqlite.connect(DB_PATH) as d:
-        d.row_factory = aiosqlite.Row
-        async with d.execute(
-            "SELECT DISTINCT user_id FROM support_chat WHERE from_admin=0 ORDER BY MAX(created_at) DESC"
-        ) as c: rows = await c.fetchall()
-    result = []
-    for r in rows:
-        u = await db.get_user(r["user_id"])
+    try:
         async with aiosqlite.connect(DB_PATH) as d:
             d.row_factory = aiosqlite.Row
             async with d.execute(
-                "SELECT message,created_at FROM support_chat WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
-                (r["user_id"],)
-            ) as c: last = await c.fetchone()
-        result.append({
-            "user_id": r["user_id"],
-            "nickname": nick_of(u),
-            "last_message": last["message"] if last else "",
-            "last_time": str(last["created_at"]) if last else "",
-        })
-    return result
+                "SELECT user_id, MAX(created_at) as last_time, "
+                "(SELECT message FROM support_chat s2 WHERE s2.user_id=s1.user_id ORDER BY created_at DESC LIMIT 1) as last_message "
+                "FROM support_chat s1 WHERE from_admin=0 GROUP BY user_id ORDER BY last_time DESC"
+            ) as c: rows = await c.fetchall()
+        result = []
+        for r in rows:
+            u = await db.get_user(r["user_id"])
+            result.append({
+                "user_id": r["user_id"],
+                "nickname": nick_of(u),
+                "last_message": r["last_message"] or "",
+                "last_time": str(r["last_time"]) if r["last_time"] else "",
+            })
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"DB error: {e}")
 
 # ── FRIENDS ───────────────────────────────────────────────
 
@@ -559,3 +558,71 @@ async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
         await d.execute("DELETE FROM global_chat WHERE id=?", (msg_id,))
         await d.commit()
     return {"ok": True}
+# ── DIRECT MESSAGES ───────────────────────────────────────
+
+@app.get("/dm/send")
+async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str = Query(...)):
+    if not message.strip(): raise HTTPException(400,"Пустое сообщение")
+    # Check friends
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT status FROM friends WHERE user_id=? AND friend_id=?", (uid, to_id)
+        ) as c: row = await c.fetchone()
+    if not row or row["status"] != "accepted":
+        raise HTTPException(403, "Можно писать только друзьям")
+    async with aiosqlite.connect(DB_PATH) as d:
+        try:
+            await d.execute("""CREATE TABLE IF NOT EXISTS dm_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_id INTEGER, to_id INTEGER, message TEXT,
+                is_read INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+        except: pass
+        await d.execute(
+            "INSERT INTO dm_messages (from_id,to_id,message) VALUES (?,?,?)",
+            (uid, to_id, message.strip())
+        )
+        await d.commit()
+    me = await db.get_user(uid)
+    asyncio.ensure_future(notify(to_id, f"[Сообщение] {nick_of(me)}: {message.strip()[:80]}"))
+    return {"ok": True}
+
+@app.get("/dm/messages")
+async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        try:
+            await d.execute("""CREATE TABLE IF NOT EXISTS dm_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_id INTEGER, to_id INTEGER, message TEXT,
+                is_read INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            await d.commit()
+        except: pass
+        # Mark as read
+        await d.execute(
+            "UPDATE dm_messages SET is_read=1 WHERE to_id=? AND from_id=?", (uid, with_id)
+        )
+        await d.commit()
+        async with d.execute(
+            "SELECT * FROM dm_messages WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?) ORDER BY created_at ASC LIMIT 100",
+            (uid, with_id, with_id, uid)
+        ) as c: rows = await c.fetchall()
+    return [{"id":r["id"],"from_id":r["from_id"],"message":r["message"],
+             "is_read":bool(r["is_read"]),"created_at":str(r["created_at"])} for r in rows]
+
+@app.get("/dm/unread_count")
+async def dm_unread(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        try:
+            await d.execute("CREATE TABLE IF NOT EXISTS dm_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, message TEXT, is_read INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            await d.commit()
+        except: pass
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT from_id, COUNT(*) as cnt FROM dm_messages WHERE to_id=? AND is_read=0 GROUP BY from_id", (uid,)
+        ) as c: rows = await c.fetchall()
+    return {str(r["from_id"]): r["cnt"] for r in rows}
