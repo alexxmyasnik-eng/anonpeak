@@ -27,8 +27,12 @@ MIN_PRICE     = 15
 MIN_WITHDRAW  = 100
 
 CATEGORIES = {
-    "signa":"🖊 Сигна","mugs":"☕ Кружки",
-    "photos":"📸 Фото","videos":"🎬 Видео",
+    "photos":    {"name": "📸 Фото",       "subs": ["Соло","Игрушки","Тематика"]},
+    "videos":    {"name": "🎬 Видео",       "subs": ["Мастурбация","Кастом","Анальное"]},
+    "domination":{"name": "⛓️ Доминация",   "subs": ["Оценка","Задания","Контроль","Унижение"]},
+    "slaves":    {"name": "🧎 Рабыня",      "subs": ["Повиновение","Отчеты"]},
+    "audio":     {"name": "🎧 Аудио",       "subs": ["Секстинг","Стоны","Унижение"]},
+    "signa":     {"name": "🖊 Сигны",       "subs": ["На теле","Видео-сигна"]},
 }
 
 async def migrate():
@@ -111,14 +115,15 @@ async def health(): return {"ok": True}
 # ── CATEGORIES ───────────────────────────────────────────
 @app.get("/categories")
 async def get_categories():
-    return [{"id":k,"name":v} for k,v in CATEGORIES.items()]
+    return [{"id":k,"name":v["name"],"subs":v["subs"]} for k,v in CATEGORIES.items()]
 
 # ── PRODUCTS ─────────────────────────────────────────────
 @app.get("/products/create")
 async def create_product(
     uid: int = Query(...), title: str = Query(...),
     description: str = Query(default=""), price: float = Query(...),
-    category: str = Query(...), is_premium: bool = Query(default=False)
+    category: str = Query(...), subcategory: str = Query(default=""),
+    is_premium: bool = Query(default=False)
 ):
     if category not in CATEGORIES: raise HTTPException(400,"Неверная категория")
     if not title or len(title)>100: raise HTTPException(400,"Название от 1 до 100 символов")
@@ -129,34 +134,46 @@ async def create_product(
             raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). Баланс: {balance:.0f} ₽")
         await db.change_balance(uid,-PREMIUM_PRICE)
     product_id = await db.add_product(uid,category,title,description or "",price,None,None)
-    if is_premium:
-        try:
-            async with aiosqlite.connect(DB_PATH) as d:
-                await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
-                    (datetime.now().isoformat(),product_id))
-                await d.commit()
+    async with aiosqlite.connect(DB_PATH) as d:
+        try: await d.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
         except: pass
+        await d.execute("UPDATE products SET subcategory=? WHERE id=?",(subcategory.strip(),product_id))
+        if is_premium:
+            await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
+                (datetime.now().isoformat(),product_id))
+        await d.commit()
     return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
 
 @app.get("/products/{category}")
-async def get_products(category: str):
+async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
     if category not in CATEGORIES: raise HTTPException(404,"Не найдено")
     async with aiosqlite.connect(DB_PATH) as d:
+        try: await d.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
+        except: pass
+        await d.commit()
         d.row_factory = aiosqlite.Row
-        async with d.execute(
-            "SELECT * FROM products WHERE category=? AND status='active' "
-            "ORDER BY COALESCE(is_premium,0) DESC, created_at DESC",(category,)
-        ) as c: rows = await c.fetchall()
+        q = "SELECT * FROM products WHERE category=? AND status='active'"
+        params = [category]
+        if sub:
+            q += " AND subcategory=?"
+            params.append(sub)
+        if seller:
+            q += " AND seller_id=?"
+            params.append(seller)
+        q += " ORDER BY COALESCE(is_premium,0) DESC, created_at DESC"
+        async with d.execute(q, params) as c:
+            rows = await c.fetchall()
     result = []
     for p in rows:
         s = await db.get_user(p["seller_id"])
         avg,_ = await db.get_seller_rating(p["seller_id"])
-        cols = [d[0] for d in p.description] if hasattr(p,'description') else list(dict(p).keys())
-        is_prem = bool(p["is_premium"]) if "is_premium" in cols else False
+        is_prem = bool(p["is_premium"]) if "is_premium" in dict(p) else False
+        sub_val = p["subcategory"] if "subcategory" in dict(p) else ""
         result.append({"id":p["id"],"title":p["title"],"description":p["description"],
-            "price":p["price"],"category":p["category"],"media_id":p["media_id"],
-            "media_type":p["media_type"],"seller_id":p["seller_id"],
-            "seller_nick":nick_of(s),"seller_rating":round(avg,1),"is_premium":is_prem,
+            "price":p["price"],"category":p["category"],"subcategory":sub_val or "",
+            "media_id":p["media_id"],"media_type":p["media_type"],
+            "seller_id":p["seller_id"],"seller_nick":nick_of(s),
+            "seller_rating":round(avg,1),"is_premium":is_prem,
             "seller_gets":round(p["price"]*(1-SELL_COMM),2)})
     return result
 
@@ -446,7 +463,39 @@ async def support_tickets(uid: int = Query(...)):
     except Exception as e:
         raise HTTPException(500, f"DB error: {e}")
 
-# ── FRIENDS ───────────────────────────────────────────────
+@app.get("/my_products")
+async def my_products(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        try: await d.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
+        except: pass
+        await d.commit()
+        d.row_factory = aiosqlite.Row
+        async with d.execute(
+            "SELECT * FROM products WHERE seller_id=? AND status='active' ORDER BY created_at DESC",
+            (uid,)
+        ) as c: rows = await c.fetchall()
+    return [{"id":p["id"],"title":p["title"],"price":p["price"],
+             "category":p["category"],"subcategory":p["subcategory"] if "subcategory" in dict(p) else "",
+             "is_premium":bool(p["is_premium"])} for p in rows]
+
+@app.get("/products/delete")
+async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
+            row = await c.fetchone()
+        if not row: raise HTTPException(404,"Товар не найден")
+        if row["seller_id"] != uid: raise HTTPException(403,"Нет доступа")
+        await d.execute("UPDATE products SET status='deleted' WHERE id=?", (product_id,))
+        await d.commit()
+    return {"ok": True}
+
+# Alias /friends → /friends/list (для совместимости с index.html)
+@app.get("/friends")
+async def friends_alias(uid: int = Query(...)):
+    return await friends_list(uid=uid)
+
+
 
 @app.get("/friends/add")
 async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
