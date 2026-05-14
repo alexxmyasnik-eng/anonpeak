@@ -144,6 +144,18 @@ async def create_product(
         await d.commit()
     return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
 
+@app.get("/products/delete")
+async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
+            row = await c.fetchone()
+        if not row: raise HTTPException(404,"Товар не найден")
+        if row["seller_id"] != uid: raise HTTPException(403,"Нет доступа")
+        await d.execute("UPDATE products SET status='deleted' WHERE id=?", (product_id,))
+        await d.commit()
+    return {"ok": True}
+
 @app.get("/products/{category}")
 async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
     if category not in CATEGORIES: raise HTTPException(404,"Не найдено")
@@ -477,18 +489,6 @@ async def my_products(uid: int = Query(...)):
     return [{"id":p["id"],"title":p["title"],"price":p["price"],
              "category":p["category"],"subcategory":p["subcategory"] if "subcategory" in dict(p) else "",
              "is_premium":bool(p["is_premium"])} for p in rows]
-
-@app.get("/products/delete")
-async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
-    async with aiosqlite.connect(DB_PATH) as d:
-        d.row_factory = aiosqlite.Row
-        async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
-            row = await c.fetchone()
-        if not row: raise HTTPException(404,"Товар не найден")
-        if row["seller_id"] != uid: raise HTTPException(403,"Нет доступа")
-        await d.execute("UPDATE products SET status='deleted' WHERE id=?", (product_id,))
-        await d.commit()
-    return {"ok": True}
 
 # Alias /friends → /friends/list (для совместимости с index.html)
 @app.get("/friends")
