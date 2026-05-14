@@ -150,7 +150,7 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
         d.row_factory = aiosqlite.Row
         async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
             row = await c.fetchone()
-        if not row: raise HTTPException(404,f"Товар {product_id} не найден")
+        if not row: raise HTTPException(404,"Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403,"Нет доступа")
         await d.execute("UPDATE products SET status='deleted' WHERE id=?", (product_id,))
         await d.commit()
@@ -323,9 +323,14 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if order["status"] not in ("paid","seller_confirmed"): raise HTTPException(400,"Нельзя закрыть")
     seller_gets = round(order["amount"]-order["commission"],2)
     await db.change_balance(order["seller_id"],seller_gets)
-    async with aiosqlite.connect(DB_PATH) as d2:
-        await d2.execute("UPDATE users SET earn_balance=COALESCE(earn_balance,0)+? WHERE user_id=?",(seller_gets,order["seller_id"]))
-        await d2.commit()
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            try: await d.execute("ALTER TABLE users ADD COLUMN earn_balance REAL DEFAULT 0")
+            except: pass
+            await d.execute("UPDATE users SET earn_balance=COALESCE(earn_balance,0)+? WHERE user_id=?",
+                (seller_gets, order["seller_id"]))
+            await d.commit()
+    except: pass
     await db.update_order_status(order_id,"done")
     return {"ok":True}
 
@@ -342,11 +347,22 @@ async def withdraw(
 ):
     if amount<MIN_WITHDRAW: raise HTTPException(400,f"Минимум {MIN_WITHDRAW} ₽")
     if not username or not username.startswith("@"): raise HTTPException(400,"Укажи @username")
-    balance = await db.get_balance(uid)
-    if balance<amount: raise HTTPException(400,f"Недостаточно средств. Баланс: {balance:.0f} ₽")
+    earn_bal = 0.0
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            async with d.execute("SELECT earn_balance FROM users WHERE user_id=?",(uid,)) as c:
+                row = await c.fetchone()
+                if row and row[0]: earn_bal = float(row[0])
+    except: pass
+    if earn_bal<amount: raise HTTPException(400,f"Недостаточно для вывода. К выводу: {earn_bal:.0f} ₽")
     after = round(amount*(1-WITHDRAW_COMM),2)
     stars = math.ceil(after/STAR_RATE)
-    await db.change_balance(uid,-amount)
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            await d.execute("UPDATE users SET earn_balance=COALESCE(earn_balance,0)-? WHERE user_id=?",
+                (amount, uid))
+            await d.commit()
+    except: pass
     w_id = await db.create_withdrawal(uid,amount)
     u = await db.get_user(uid)
     asyncio.create_task(notify(ADMIN_ID,
