@@ -150,7 +150,7 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
         d.row_factory = aiosqlite.Row
         async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
             row = await c.fetchone()
-        if not row: raise HTTPException(404,"Товар не найден")
+        if not row: raise HTTPException(404,f"Товар {product_id} не найден")
         if row["seller_id"] != uid: raise HTTPException(403,"Нет доступа")
         await d.execute("UPDATE products SET status='deleted' WHERE id=?", (product_id,))
         await d.commit()
@@ -323,6 +323,9 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if order["status"] not in ("paid","seller_confirmed"): raise HTTPException(400,"Нельзя закрыть")
     seller_gets = round(order["amount"]-order["commission"],2)
     await db.change_balance(order["seller_id"],seller_gets)
+    async with aiosqlite.connect(DB_PATH) as d2:
+        await d2.execute("UPDATE users SET earn_balance=COALESCE(earn_balance,0)+? WHERE user_id=?",(seller_gets,order["seller_id"]))
+        await d2.commit()
     await db.update_order_status(order_id,"done")
     return {"ok":True}
 
