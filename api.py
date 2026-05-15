@@ -65,6 +65,24 @@ async def migrate():
                 user_id INTEGER, muted_id INTEGER,
                 PRIMARY KEY(user_id, muted_id)
             )""",
+            """CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                type TEXT,
+                amount REAL,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            """CREATE TABLE IF NOT EXISTS frozen_funds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                order_id INTEGER,
+                amount REAL,
+                unfreeze_at TIMESTAMP,
+                is_released INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            "ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''",
         ]:
             try: await d.execute(sql)
             except: pass
@@ -322,16 +340,21 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if not order or order["buyer_id"]!=uid: raise HTTPException(403,"Нет доступа")
     if order["status"] not in ("paid","seller_confirmed"): raise HTTPException(400,"Нельзя закрыть")
     seller_gets = round(order["amount"]-order["commission"],2)
-    await db.change_balance(order["seller_id"],seller_gets)
-    try:
-        async with aiosqlite.connect(DB_PATH) as d:
-            try: await d.execute("ALTER TABLE users ADD COLUMN earn_balance REAL DEFAULT 0")
-            except: pass
-            await d.execute("UPDATE users SET earn_balance=COALESCE(earn_balance,0)+? WHERE user_id=?",
-                (seller_gets, order["seller_id"]))
-            await d.commit()
-    except: pass
+    from datetime import datetime, timedelta
+    unfreeze_at = (datetime.now() + timedelta(days=2)).isoformat()
+    async with aiosqlite.connect(DB_PATH) as d:
+        await d.execute(
+            "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES (?,?,?,?)",
+            (order["seller_id"], order_id, seller_gets, unfreeze_at))
+        await d.execute(
+            "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
+            (order["seller_id"], "frozen", seller_gets,
+             f"Продажа заморожена до {unfreeze_at[:10]} (заказ #{order_id})"))
+        await d.commit()
     await db.update_order_status(order_id,"done")
+    # Notify seller
+    asyncio.create_task(notify(order["seller_id"],
+        f"💰 Продажа завершена! {seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
     return {"ok":True}
 
 @app.get("/topup/create")
@@ -339,6 +362,7 @@ async def topup_create(amount: int = Query(...), uid: int = Query(...)):
     if amount<10: raise HTTPException(400,"Минимум 10 ₽")
     code = gen_code()
     topup_id = await db.create_topup(uid,amount,code)
+    # Transaction will be recorded when topup is confirmed (by bot)
     return {"topup_id":topup_id,"code":code,"da_link":DA_LINK,"amount":amount}
 
 @app.get("/withdraw")
@@ -347,28 +371,70 @@ async def withdraw(
 ):
     if amount<MIN_WITHDRAW: raise HTTPException(400,f"Минимум {MIN_WITHDRAW} ₽")
     if not username or not username.startswith("@"): raise HTTPException(400,"Укажи @username")
-    earn_bal = 0.0
-    try:
-        async with aiosqlite.connect(DB_PATH) as d:
-            async with d.execute("SELECT earn_balance FROM users WHERE user_id=?",(uid,)) as c:
-                row = await c.fetchone()
-                if row and row[0]: earn_bal = float(row[0])
-    except: pass
-    if earn_bal<amount: raise HTTPException(400,f"Недостаточно для вывода. К выводу: {earn_bal:.0f} ₽")
+    balance = await db.get_balance(uid)
+    if balance<amount: raise HTTPException(400,f"Недостаточно средств. Баланс: {balance:.0f} ₽")
     after = round(amount*(1-WITHDRAW_COMM),2)
     stars = math.ceil(after/STAR_RATE)
+    await db.change_balance(uid,-amount)
+    w_id = await db.create_withdrawal(uid,amount)
     try:
         async with aiosqlite.connect(DB_PATH) as d:
-            await d.execute("UPDATE users SET earn_balance=COALESCE(earn_balance,0)-? WHERE user_id=?",
-                (amount, uid))
+            await d.execute(
+                "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
+                (uid, "withdraw", -amount, f"Вывод ⭐{stars} · комиссия {round(amount*WITHDRAW_COMM,2)} ₽"))
             await d.commit()
     except: pass
-    w_id = await db.create_withdrawal(uid,amount)
     u = await db.get_user(uid)
     asyncio.create_task(notify(ADMIN_ID,
         f"💸 <b>Вывод #{w_id}</b>\n👤 {nick_of(u)} (ID:{uid})\n"
         f"💰 {amount:.0f} ₽ → {after:.0f} ₽ → ⭐{stars}\n📱 {username}"))
     return {"ok":True,"w_id":w_id,"after_commission":after,"stars":stars}
+
+
+# ── TRANSACTIONS ──────────────────────────────────────────
+
+@app.get("/transactions")
+async def get_transactions(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        try:
+            await d.execute("""CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, type TEXT, amount REAL, description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            await d.execute("""CREATE TABLE IF NOT EXISTS frozen_funds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER, order_id INTEGER, amount REAL,
+                unfreeze_at TIMESTAMP, is_released INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            await d.commit()
+        except: pass
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        async with d.execute(
+            "SELECT * FROM frozen_funds WHERE user_id=? AND is_released=0 AND unfreeze_at<=?",
+            (uid, now)
+        ) as c: due = await c.fetchall()
+        for f in due:
+            await db.change_balance(uid, f["amount"])
+            await d.execute("UPDATE frozen_funds SET is_released=1 WHERE id=?",(f["id"],))
+            await d.execute(
+                "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
+                (uid, "sale", f["amount"], "Продажа разморожена (заказ #"+str(f["order_id"])+")"))
+        if due: await d.commit()
+        async with d.execute(
+            "SELECT * FROM frozen_funds WHERE user_id=? AND is_released=0 ORDER BY unfreeze_at ASC",(uid,)
+        ) as c: frozen = await c.fetchall()
+        async with d.execute(
+            "SELECT * FROM transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 50",(uid,)
+        ) as c: txs = await c.fetchall()
+    frozen_list = [{"id":f["id"],"amount":f["amount"],"order_id":f["order_id"],
+                    "unfreeze_at":str(f["unfreeze_at"]),
+                    "description":"❄️ Заморожено до "+str(f["unfreeze_at"])[:10]}
+                   for f in frozen]
+    tx_list = [{"id":t["id"],"type":t["type"],"amount":t["amount"],
+                "description":t["description"],"created_at":str(t["created_at"])} for t in txs]
+    return {"transactions": tx_list, "frozen": frozen_list}
 
 @app.get("/support")
 async def support(uid: int = Query(...), message: str = Query(...)):
