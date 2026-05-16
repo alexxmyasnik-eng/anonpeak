@@ -184,9 +184,9 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
         d.row_factory = aiosqlite.Row
         q = "SELECT * FROM products WHERE category=? AND status='active'"
         params = [category]
-        if sub:
-            q += " AND subcategory=?"
-            params.append(sub)
+        if sub and sub.strip():
+            q += " AND TRIM(subcategory)=?"
+            params.append(sub.strip())
         if seller:
             q += " AND seller_id=?"
             params.append(seller)
