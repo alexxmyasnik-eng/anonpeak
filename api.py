@@ -17,7 +17,8 @@ import database as db
 try:
     from config import BOT_TOKEN, ADMIN_ID, DA_LINK, DB_PATH
 except ImportError:
-    BOT_TOKEN = ""; ADMIN_ID = 0; DA_LINK = "https://donationalerts.com"; DB_PATH = "bot.db"
+    BOT_TOKEN = ""
+    ADMIN_ID = 0; DA_LINK = "https://donationalerts.com"; DB_PATH = "bot.db"
 
 SELL_COMM     = 0.16
 WITHDRAW_COMM = 0.05
@@ -145,11 +146,11 @@ async def create_product(
 ):
     if category not in CATEGORIES: raise HTTPException(400,"Неверная категория")
     if not title or len(title)>100: raise HTTPException(400,"Название от 1 до 100 символов")
-    if price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
+    if price!=0 and price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
     if is_premium:
         balance = await db.get_balance(uid)
         if balance<PREMIUM_PRICE:
-            raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). Баланс: {balance:.0f} ₽")
+            raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽).\nБаланс: {balance:.0f} ₽")
         await db.change_balance(uid,-PREMIUM_PRICE)
     product_id = await db.add_product(uid,category,title,description or "",price,None,None)
     async with aiosqlite.connect(DB_PATH) as d:
@@ -158,7 +159,7 @@ async def create_product(
         await d.execute("UPDATE products SET subcategory=? WHERE id=?",(subcategory.strip(),product_id))
         if is_premium:
             await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
-                (datetime.now().isoformat(),product_id))
+                 (datetime.now().isoformat(),product_id))
         await d.commit()
     return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
 
@@ -354,7 +355,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     await db.update_order_status(order_id,"done")
     # Notify seller
     asyncio.create_task(notify(order["seller_id"],
-        f"💰 Продажа завершена! {seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
+        f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
     return {"ok":True}
 
 @app.get("/topup/create")
@@ -431,7 +432,7 @@ async def get_transactions(uid: int = Query(...)):
     frozen_list = [{"id":f["id"],"amount":f["amount"],"order_id":f["order_id"],
                     "unfreeze_at":str(f["unfreeze_at"]),
                     "description":"❄️ Заморожено до "+str(f["unfreeze_at"])[:10]}
-                   for f in frozen]
+                  for f in frozen]
     tx_list = [{"id":t["id"],"type":t["type"],"amount":t["amount"],
                 "description":t["description"],"created_at":str(t["created_at"])} for t in txs]
     return {"transactions": tx_list, "frozen": frozen_list}
@@ -579,8 +580,6 @@ async def my_products(uid: int = Query(...)):
 @app.get("/friends")
 async def friends_alias(uid: int = Query(...)):
     return await friends_list(uid=uid)
-
-
 
 @app.get("/friends/add")
 async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
