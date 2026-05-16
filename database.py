@@ -154,13 +154,15 @@ async def get_last_chat_time(user_id: int):
 
 # ─── PRODUCTS ────────────────────────────────────────────
 
+# СТАЛО:
 async def add_product(seller_id, category, title, description, price, media_id, media_type):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        c = await db.execute(
             "INSERT INTO products (seller_id,category,title,description,price,media_id,media_type) VALUES (?,?,?,?,?,?,?)",
             (seller_id, category, title, description, price, media_id, media_type)
         )
         await db.commit()
+        return c.lastrowid
 
 async def get_products_by_category(category: str):
     async with aiosqlite.connect(DB_PATH) as db:
