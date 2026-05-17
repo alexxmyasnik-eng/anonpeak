@@ -145,7 +145,7 @@ async def create_product(
 ):
     if category not in CATEGORIES: raise HTTPException(400,"Неверная категория")
     if not title or len(title)>100: raise HTTPException(400,"Название от 1 до 100 символов")
-    if price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
+    if price!=0 and price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
     if is_premium:
         balance = await db.get_balance(uid)
         if balance<PREMIUM_PRICE:
