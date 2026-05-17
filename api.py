@@ -4,7 +4,7 @@ try:
     HAS_AIOHTTP = True
 except ImportError:
     HAS_AIOHTTP = False
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -14,10 +14,14 @@ from fastapi.responses import JSONResponse
 
 import database as db
 
+# Настройка часового пояса (МСК, UTC+3)
+MSK = timezone(timedelta(hours=3))
+
 try:
     from config import BOT_TOKEN, ADMIN_ID, DA_LINK, DB_PATH
 except ImportError:
-    BOT_TOKEN = ""; ADMIN_ID = 0; DA_LINK = "https://donationalerts.com"; DB_PATH = "bot.db"
+    BOT_TOKEN = ""
+    ADMIN_ID = 0; DA_LINK = "https://donationalerts.com"; DB_PATH = "bot.db"
 
 SELL_COMM     = 0.16
 WITHDRAW_COMM = 0.05
@@ -150,7 +154,7 @@ async def create_product(
     if is_premium:
         balance = await db.get_balance(uid)
         if balance<PREMIUM_PRICE:
-            raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽). Баланс: {balance:.0f} ₽")
+            raise HTTPException(400,f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽).\nБаланс: {balance:.0f} ₽")
         await db.change_balance(uid,-PREMIUM_PRICE)
     product_id = await db.add_product(uid,category,title,description or "",price,None,None)
     async with aiosqlite.connect(DB_PATH) as d:
@@ -159,7 +163,7 @@ async def create_product(
         await d.execute("UPDATE products SET subcategory=? WHERE id=?",(subcategory.strip(),product_id))
         if is_premium:
             await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
-                (datetime.now().isoformat(),product_id))
+                 (datetime.now(MSK).isoformat(),product_id))
         await d.commit()
     return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
 
@@ -369,8 +373,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if not order or order["buyer_id"]!=uid: raise HTTPException(403,"Нет доступа")
     if order["status"] not in ("paid","seller_confirmed"): raise HTTPException(400,"Нельзя закрыть")
     seller_gets = round(order["amount"]-order["commission"],2)
-    from datetime import datetime, timedelta
-    unfreeze_at = (datetime.now() + timedelta(days=2)).isoformat()
+    unfreeze_at = (datetime.now(MSK) + timedelta(days=2)).isoformat()
     async with aiosqlite.connect(DB_PATH) as d:
         await d.execute(
             "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES (?,?,?,?)",
@@ -379,7 +382,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     await db.update_order_status(order_id,"done")
     # Notify seller
     asyncio.create_task(notify(order["seller_id"],
-        f"💰 Продажа завершена! {seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
+        f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
     return {"ok":True}
 
 @app.get("/topup/create")
@@ -434,8 +437,7 @@ async def get_transactions(uid: int = Query(...)):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             await d.commit()
         except: pass
-        from datetime import datetime
-        now = datetime.now().isoformat()
+        now = datetime.now(MSK).isoformat()
         async with d.execute(
             "SELECT * FROM frozen_funds WHERE user_id=? AND is_released=0 AND unfreeze_at<=?",
             (uid, now)
@@ -456,7 +458,7 @@ async def get_transactions(uid: int = Query(...)):
     frozen_list = [{"id":f["id"],"amount":f["amount"],"order_id":f["order_id"],
                     "unfreeze_at":str(f["unfreeze_at"]),
                     "description":"❄️ Заморожено до "+str(f["unfreeze_at"])[:10]}
-                   for f in frozen]
+                  for f in frozen]
     tx_list = [{"id":t["id"],"type":t["type"],"amount":t["amount"],
                 "description":t["description"],"created_at":str(t["created_at"])} for t in txs]
     return {"transactions": tx_list, "frozen": frozen_list}
