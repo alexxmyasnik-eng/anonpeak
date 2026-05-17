@@ -83,6 +83,7 @@ async def migrate():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""",
             "ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''",
+            "ALTER TABLE products ADD COLUMN preview_url TEXT DEFAULT ''",
         ]:
             try: await d.execute(sql)
             except: pass
@@ -174,6 +175,24 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
         await d.commit()
     return {"ok": True}
 
+@app.post("/products/{product_id}/set_preview")
+async def set_product_preview(product_id: int, uid: int = Query(...), request: Request = None):
+    data_url = await request.body()
+    data_url = data_url.decode("utf-8", errors="ignore")
+    if not data_url.startswith("data:image/"):
+        raise HTTPException(400, "Только изображения")
+    if len(data_url) > 5_000_000:
+        raise HTTPException(400, "Файл слишком большой (макс 3.7 МБ)")
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
+            row = await c.fetchone()
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+        await d.execute("UPDATE products SET preview_url=? WHERE id=?", (data_url, product_id))
+        await d.commit()
+    return {"ok": True}
+
 @app.get("/products/{category}")
 async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
     if category not in CATEGORIES: raise HTTPException(404,"Не найдено")
@@ -199,9 +218,11 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
         avg,_ = await db.get_seller_rating(p["seller_id"])
         is_prem = bool(p["is_premium"]) if "is_premium" in dict(p) else False
         sub_val = p["subcategory"] if "subcategory" in dict(p) else ""
+        prev_url = p["preview_url"] if "preview_url" in dict(p) else ""
         result.append({"id":p["id"],"title":p["title"],"description":p["description"],
             "price":p["price"],"category":p["category"],"subcategory":sub_val or "",
             "media_id":p["media_id"],"media_type":p["media_type"],
+            "preview_url":prev_url or "",
             "seller_id":p["seller_id"],"seller_nick":nick_of(s),
             "seller_rating":round(avg,1),"is_premium":is_prem,
             "seller_gets":round(p["price"]*(1-SELL_COMM),2)})
@@ -213,8 +234,16 @@ async def get_product(product_id: int):
     if not p: raise HTTPException(404,"Не найдено")
     s = await db.get_user(p["seller_id"])
     avg,cnt = await db.get_seller_rating(p["seller_id"])
+    prev_url = ""
+    try:
+        async with aiosqlite.connect(DB_PATH) as d:
+            async with d.execute("SELECT preview_url FROM products WHERE id=?", (product_id,)) as c:
+                row = await c.fetchone()
+                if row and row[0]: prev_url = row[0]
+    except: pass
     return {"id":p["id"],"title":p["title"],"description":p["description"],
         "price":p["price"],"category":p["category"],"media_id":p["media_id"],
+        "preview_url":prev_url,
         "media_type":p["media_type"],"seller_id":p["seller_id"],
         "seller_nick":nick_of(s),"seller_rating":round(avg,1),"seller_reviews":cnt,
         "seller_gets":round(p["price"]*(1-SELL_COMM),2)}
