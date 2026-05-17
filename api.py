@@ -375,10 +375,6 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
         await d.execute(
             "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES (?,?,?,?)",
             (order["seller_id"], order_id, seller_gets, unfreeze_at))
-        await d.execute(
-            "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
-            (order["seller_id"], "frozen", seller_gets,
-             f"Продажа заморожена до {unfreeze_at[:10]} (заказ #{order_id})"))
         await d.commit()
     await db.update_order_status(order_id,"done")
     # Notify seller
