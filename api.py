@@ -88,6 +88,7 @@ async def migrate():
             )""",
             "ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''",
             "ALTER TABLE products ADD COLUMN preview_url TEXT DEFAULT ''",
+            "ALTER TABLE products ADD COLUMN delivery_files TEXT DEFAULT '[]'",
         ]:
             try: await d.execute(sql)
             except: pass
@@ -196,6 +197,42 @@ async def set_product_preview(product_id: int, uid: int = Query(...), request: R
         await d.execute("UPDATE products SET preview_url=? WHERE id=?", (data_url, product_id))
         await d.commit()
     return {"ok": True}
+
+@app.post("/products/{product_id}/add_delivery_file")
+async def add_delivery_file(product_id: int, uid: int = Query(...), request: Request = None):
+    data_url = (await request.body()).decode("utf-8", errors="ignore")
+    if not data_url.startswith("data:image/"):
+        raise HTTPException(400, "Только изображения")
+    if len(data_url) > 5_000_000:
+        raise HTTPException(400, "Файл слишком большой (макс ~3.7 МБ)")
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT seller_id, delivery_files FROM products WHERE id=?", (product_id,)) as c:
+            row = await c.fetchone()
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+        try:
+            files = json.loads(row["delivery_files"] or "[]")
+        except:
+            files = []
+        if len(files) >= 20: raise HTTPException(400, "Максимум 20 файлов")
+        files.append(data_url)
+        await d.execute("UPDATE products SET delivery_files=? WHERE id=?", (json.dumps(files), product_id))
+        await d.commit()
+    return {"ok": True}
+
+@app.get("/products/{product_id}/delivery_files")
+async def get_product_delivery_files(product_id: int):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT delivery_files FROM products WHERE id=?", (product_id,)) as c:
+            row = await c.fetchone()
+        if not row: raise HTTPException(404, "Товар не найден")
+        try:
+            files = json.loads(row["delivery_files"] or "[]")
+        except:
+            files = []
+    return {"files": files}
 
 @app.get("/products/{category}")
 async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
@@ -321,7 +358,7 @@ async def get_orders(uid: int = Query(...)):
             "product_title":p["title"] if p else "Удалён","amount":o["amount"],
             "status":o["status"],"buyer_id":o["buyer_id"],"seller_id":o["seller_id"],
             "partner_nick":nick_of(partner),"role":"buyer" if o["buyer_id"]==uid else "seller",
-            "commission":o["commission"],"unread":unread})
+            "commission":o["commission"],"unread":unread, "product_id":o["product_id"]})
     return result
 
 @app.get("/orders/{order_id}/messages")
@@ -380,7 +417,6 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
             (order["seller_id"], order_id, seller_gets, unfreeze_at))
         await d.commit()
     await db.update_order_status(order_id,"done")
-    # Notify seller
     asyncio.create_task(notify(order["seller_id"],
         f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
     return {"ok":True}
@@ -390,7 +426,6 @@ async def topup_create(amount: int = Query(...), uid: int = Query(...)):
     if amount<10: raise HTTPException(400,"Минимум 10 ₽")
     code = gen_code()
     topup_id = await db.create_topup(uid,amount,code)
-    # Transaction will be recorded when topup is confirmed (by bot)
     return {"topup_id":topup_id,"code":code,"da_link":DA_LINK,"amount":amount}
 
 @app.get("/withdraw")
@@ -418,9 +453,7 @@ async def withdraw(
         f"💰 {amount:.0f} ₽ → {after:.0f} ₽ → ⭐{stars}\n📱 {username}"))
     return {"ok":True,"w_id":w_id,"after_commission":after,"stars":stars}
 
-
 # ── TRANSACTIONS ──────────────────────────────────────────
-
 @app.get("/transactions")
 async def get_transactions(uid: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
@@ -478,15 +511,12 @@ async def support(uid: int = Query(...), message: str = Query(...)):
         pass
     return {"ok": True, "ticket_id": ticket_id}
 
-
 # ── GLOBAL CHAT ───────────────────────────────────────────
-
 @app.post("/me/set_avatar")
 async def set_avatar_post(request: Request, uid: int = Query(...)):
-    """Принимает base64 аватарку через POST body."""
     try:
         body = await request.body()
-        avatar_data = body.decode('utf-8')[:15000000]  # max 10mb base64
+        avatar_data = body.decode('utf-8')[:15000000]
         async with aiosqlite.connect(DB_PATH) as d:
             try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
             except: pass
@@ -528,7 +558,6 @@ async def get_user_profile(user_id: int):
     }
 
 # ── SUPPORT CHAT ──────────────────────────────────────────
-
 @app.get("/support/messages")
 async def support_messages(uid: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
@@ -564,7 +593,6 @@ async def support_reply(uid: int = Query(...), user_id: int = Query(...), messag
 
 @app.get("/support/tickets")
 async def support_tickets(uid: int = Query(...)):
-    """Список всех тикетов для админа."""
     if uid != ADMIN_ID: raise HTTPException(403,"Нет доступа")
     try:
         async with aiosqlite.connect(DB_PATH) as d:
@@ -602,12 +630,9 @@ async def my_products(uid: int = Query(...)):
              "category":p["category"],"subcategory":p["subcategory"] if "subcategory" in dict(p) else "",
              "is_premium":bool(p["is_premium"])} for p in rows]
 
-# Alias /friends → /friends/list (для совместимости с index.html)
 @app.get("/friends")
 async def friends_alias(uid: int = Query(...)):
     return await friends_list(uid=uid)
-
-
 
 @app.get("/friends/add")
 async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
@@ -714,17 +739,15 @@ async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
         async with d.execute("SELECT user_id FROM global_chat WHERE id=?", (msg_id,)) as c:
             row = await c.fetchone()
         if not row: raise HTTPException(404,"Сообщение не найдено")
-        # Удалять может только автор
         if row["user_id"] != uid: raise HTTPException(403,"Нет доступа")
         await d.execute("DELETE FROM global_chat WHERE id=?", (msg_id,))
         await d.commit()
     return {"ok": True}
-# ── DIRECT MESSAGES ───────────────────────────────────────
 
+# ── DIRECT MESSAGES ───────────────────────────────────────
 @app.get("/dm/send")
 async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str = Query(...)):
     if not message.strip(): raise HTTPException(400,"Пустое сообщение")
-    # Check friends
     async with aiosqlite.connect(DB_PATH) as d:
         d.row_factory = aiosqlite.Row
         async with d.execute(
@@ -763,7 +786,6 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
             )""")
             await d.commit()
         except: pass
-        # Mark as read
         await d.execute(
             "UPDATE dm_messages SET is_read=1 WHERE to_id=? AND from_id=?", (uid, with_id)
         )
