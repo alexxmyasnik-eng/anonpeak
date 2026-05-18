@@ -809,3 +809,41 @@ async def dm_unread(uid: int = Query(...)):
             "SELECT from_id, COUNT(*) as cnt FROM dm_messages WHERE to_id=? AND is_read=0 GROUP BY from_id", (uid,)
         ) as c: rows = await c.fetchall()
     return {str(r["from_id"]): r["cnt"] for r in rows}
+
+@app.get("/dm/conversations")
+async def dm_conversations(uid: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        try:
+            await d.execute("""CREATE TABLE IF NOT EXISTS dm_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_id INTEGER, to_id INTEGER, message TEXT,
+                is_read INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            await d.commit()
+        except: pass
+        # Получаем всех с кем была переписка + последнее сообщение
+        async with d.execute("""
+            SELECT 
+                CASE WHEN from_id=? THEN to_id ELSE from_id END as partner_id,
+                message, created_at, is_read, from_id,
+                COUNT(CASE WHEN to_id=? AND is_read=0 THEN 1 END) as unread
+            FROM dm_messages
+            WHERE from_id=? OR to_id=?
+            GROUP BY partner_id
+            ORDER BY created_at DESC
+        """, (uid, uid, uid, uid)) as c:
+            rows = await c.fetchall()
+    result = []
+    for r in rows:
+        partner = await db.get_user(r["partner_id"])
+        result.append({
+            "partner_id": r["partner_id"],
+            "nickname": nick_of(partner),
+            "last_message": r["message"],
+            "created_at": str(r["created_at"]),
+            "unread": r["unread"],
+            "is_out": r["from_id"] == uid
+        })
+    return result
