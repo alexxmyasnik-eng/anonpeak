@@ -694,22 +694,6 @@ async def friend_status(uid: int = Query(...), other_id: int = Query(...)):
         ) as c: row = await c.fetchone()
     return {"status": row["status"] if row else "none"}
 
-@app.get("/friends/remove")
-async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
-    async with aiosqlite.connect(DB_PATH) as d:
-        await d.execute("DELETE FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)",
-                        (uid, friend_id, friend_id, uid))
-        await d.commit()
-    return {"ok": True}
-
-@app.get("/dm/delete_history")
-async def dm_delete_history(uid: int = Query(...), friend_id: int = Query(...)):
-    async with aiosqlite.connect(DB_PATH) as d:
-        await d.execute("DELETE FROM dm_messages WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)",
-                        (uid, friend_id, friend_id, uid))
-        await d.commit()
-    return {"ok": True}
-
 @app.get("/chat/messages")
 async def chat_messages(limit: int = Query(default=50)):
     try:
@@ -860,7 +844,6 @@ async def dm_conversations(uid: int = Query(...)):
             "last_message": r["message"],
             "created_at": str(r["created_at"]),
             "unread": r["unread"],
-            "avatar_url": partner.get("avatar_url","") if partner else "",
-        "is_out": r["from_id"] == uid
+            "is_out": r["from_id"] == uid
         })
     return result
