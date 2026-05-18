@@ -669,6 +669,26 @@ async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
     asyncio.ensure_future(notify(friend_id, f"[Друзья] {nick_of(u)} принял вашу заявку"))
     return {"ok": True}
 
+@app.get("/friends/cancel")
+async def cancel_friend_request(uid: int = Query(...), friend_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        await d.execute(
+            "DELETE FROM friends WHERE user_id=? AND friend_id=? AND status='pending'",
+            (uid, friend_id)
+        )
+        await d.commit()
+    return {"ok": True}
+
+@app.get("/friends/remove")
+async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        await d.execute(
+            "DELETE FROM friends WHERE (user_id=? AND friend_id=?) OR (user_id=? AND friend_id=?)",
+            (uid, friend_id, friend_id, uid)
+        )
+        await d.commit()
+    return {"ok": True}
+
 @app.get("/friends/list")
 async def friends_list(uid: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
