@@ -777,7 +777,7 @@ async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
 
 # ── DIRECT MESSAGES ───────────────────────────────────────
 @app.get("/dm/send")
-async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str = Query(...)):
+async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str = Query(...), reply_to_text: str = Query(default="")):
     if not message.strip(): raise HTTPException(400,"Пустое сообщение")
     async with aiosqlite.connect(DB_PATH) as d:
         d.row_factory = aiosqlite.Row
@@ -795,7 +795,6 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
         except: pass
-        reply_to_text = request.query_params.get("reply_to_text", "")
         await d.execute(
             "INSERT INTO dm_messages (from_id,to_id,message,reply_to_text) VALUES (?,?,?,?)",
             (uid, to_id, message.strip(), reply_to_text.strip())
