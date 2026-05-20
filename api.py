@@ -885,10 +885,10 @@ async def dm_conversations(uid: int = Query(...)):
                 message, created_at, is_read, from_id,
                 COUNT(CASE WHEN to_id=? AND is_read=0 THEN 1 END) as unread
             FROM dm_messages
-            WHERE from_id=? OR to_id=?
-            GROUP BY partner_id
-            ORDER BY created_at DESC
-        """, (uid, uid, uid, uid)) as c:
+            WHERE (from_id=? OR to_id=?)
+            GROUP BY CASE WHEN from_id=? THEN to_id ELSE from_id END
+            ORDER BY MAX(created_at) DESC
+        """, (uid, uid, uid, uid, uid)) as c:
             rows = await c.fetchall()
     result = []
     for r in rows:
