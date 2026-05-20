@@ -720,10 +720,21 @@ async def friend_requests(uid: int = Query(...)):
 async def friend_status(uid: int = Query(...), other_id: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         d.row_factory = aiosqlite.Row
+        # Проверяем: я отправил заявку ему
         async with d.execute(
             "SELECT status FROM friends WHERE user_id=? AND friend_id=?",(uid,other_id)
-        ) as c: row = await c.fetchone()
-    return {"status": row["status"] if row else "none"}
+        ) as c: sent = await c.fetchone()
+        # Проверяем: он отправил заявку мне
+        async with d.execute(
+            "SELECT status FROM friends WHERE user_id=? AND friend_id=?",(other_id,uid)
+        ) as c: received = await c.fetchone()
+    if sent and sent["status"] == "accepted":
+        return {"status": "accepted"}
+    if sent and sent["status"] == "pending":
+        return {"status": "pending_sent"}
+    if received and received["status"] == "pending":
+        return {"status": "pending_received"}
+    return {"status": "none"}
 
 @app.get("/chat/messages")
 async def chat_messages(limit: int = Query(default=50)):
