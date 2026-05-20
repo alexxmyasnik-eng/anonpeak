@@ -898,7 +898,8 @@ async def dm_conversations(uid: int = Query(...)):
             "last_message": r["message"],
             "created_at": str(r["created_at"]),
             "unread": r["unread"],
-            "is_out": r["from_id"] == uid
+            "is_out": r["from_id"] == uid,
+            "avatar_url": partner["avatar_url"] if partner and partner.get("avatar_url") else ""
         })
     return result
 
