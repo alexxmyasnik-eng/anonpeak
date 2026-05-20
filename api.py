@@ -90,7 +90,6 @@ async def migrate():
             "ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''",
             "ALTER TABLE products ADD COLUMN preview_url TEXT DEFAULT ''",
             "ALTER TABLE products ADD COLUMN delivery_files TEXT DEFAULT '[]'",
-            "ALTER TABLE dm_messages ADD COLUMN reply_to_text TEXT DEFAULT ''",
         ]:
             try: await d.execute(sql)
             except: pass
@@ -874,32 +873,21 @@ async def dm_conversations(uid: int = Query(...)):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_id INTEGER, to_id INTEGER, message TEXT,
                 is_read INTEGER DEFAULT 0,
-                reply_to_text TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             await d.commit()
         except: pass
+        # Получаем всех с кем была переписка + последнее сообщение
         async with d.execute("""
-            SELECT
-                partner_id,
-                message,
-                created_at,
-                from_id,
-                SUM(CASE WHEN to_id=? AND is_read=0 THEN 1 ELSE 0 END) as unread
-            FROM (
-                SELECT
-                    CASE WHEN from_id=? THEN to_id ELSE from_id END as partner_id,
-                    message, created_at, from_id, to_id, is_read,
-                    MAX(created_at) OVER (
-                        PARTITION BY CASE WHEN from_id=? THEN to_id ELSE from_id END
-                    ) as last_ts
-                FROM dm_messages
-                WHERE from_id=? OR to_id=?
-            ) sub
-            WHERE created_at = last_ts
+            SELECT 
+                CASE WHEN from_id=? THEN to_id ELSE from_id END as partner_id,
+                message, created_at, is_read, from_id,
+                COUNT(CASE WHEN to_id=? AND is_read=0 THEN 1 END) as unread
+            FROM dm_messages
+            WHERE from_id=? OR to_id=?
             GROUP BY partner_id
             ORDER BY created_at DESC
-        """, (uid, uid, uid, uid, uid)) as c:
+        """, (uid, uid, uid, uid)) as c:
             rows = await c.fetchall()
     result = []
     for r in rows:
@@ -910,8 +898,7 @@ async def dm_conversations(uid: int = Query(...)):
             "last_message": r["message"],
             "created_at": str(r["created_at"]),
             "unread": r["unread"],
-            "is_out": r["from_id"] == uid,
-            "avatar_url": partner["avatar_url"] if partner and partner.get("avatar_url") else ""
+            "is_out": r["from_id"] == uid
         })
     return result
 
