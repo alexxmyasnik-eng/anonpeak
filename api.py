@@ -874,20 +874,31 @@ async def dm_conversations(uid: int = Query(...)):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_id INTEGER, to_id INTEGER, message TEXT,
                 is_read INTEGER DEFAULT 0,
+                reply_to_text TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             await d.commit()
         except: pass
-        # Получаем всех с кем была переписка + последнее сообщение
         async with d.execute("""
-            SELECT 
-                CASE WHEN from_id=? THEN to_id ELSE from_id END as partner_id,
-                message, created_at, is_read, from_id,
-                COUNT(CASE WHEN to_id=? AND is_read=0 THEN 1 END) as unread
-            FROM dm_messages
-            WHERE (from_id=? OR to_id=?)
-            GROUP BY CASE WHEN from_id=? THEN to_id ELSE from_id END
-            ORDER BY MAX(created_at) DESC
+            SELECT
+                partner_id,
+                message,
+                created_at,
+                from_id,
+                SUM(CASE WHEN to_id=? AND is_read=0 THEN 1 ELSE 0 END) as unread
+            FROM (
+                SELECT
+                    CASE WHEN from_id=? THEN to_id ELSE from_id END as partner_id,
+                    message, created_at, from_id, to_id, is_read,
+                    MAX(created_at) OVER (
+                        PARTITION BY CASE WHEN from_id=? THEN to_id ELSE from_id END
+                    ) as last_ts
+                FROM dm_messages
+                WHERE from_id=? OR to_id=?
+            ) sub
+            WHERE created_at = last_ts
+            GROUP BY partner_id
+            ORDER BY created_at DESC
         """, (uid, uid, uid, uid, uid)) as c:
             rows = await c.fetchall()
     result = []
