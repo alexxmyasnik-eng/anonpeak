@@ -791,6 +791,7 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
             await d.execute("""CREATE TABLE IF NOT EXISTS dm_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_id INTEGER, to_id INTEGER, message TEXT,
+                reply_to_text TEXT DEFAULT '',
                 is_read INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
