@@ -1,4 +1,5 @@
-import random, string, math, aiosqlite, asyncio, json
+import random, string, math, aiosqlite, asyncio, json, hmac, hashlib, urllib.parse, time
+from collections import defaultdict
 try:
     import aiohttp
     HAS_AIOHTTP = True
@@ -94,10 +95,17 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+ALLOWED_ORIGINS = [
+    "https://alexxmyasnik-eng.github.io",
+    "https://t.me",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"],
-    allow_headers=["*"], allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type"],
+    allow_credentials=False,
 )
 
 def gen_code():
@@ -118,7 +126,47 @@ async def notify(chat_id, text):
     except Exception:
         pass
 
-async def require_uid(uid: Optional[str] = Query(default=None)) -> int:
+def verify_telegram_init_data(init_data: str) -> Optional[int]:
+    """Верифицирует подпись Telegram initData. Возвращает user_id или None."""
+    try:
+        parsed = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+        received_hash = parsed.pop("hash", None)
+        if not received_hash:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_hash, received_hash):
+            return None
+        user_data = json.loads(parsed.get("user", "{}"))
+        return user_data.get("id")
+    except Exception:
+        return None
+
+# Rate limiting для глобального чата
+_chat_ratelimit: dict = defaultdict(list)
+
+def check_rate_limit(user_id: int, max_msgs: int = 5, window_sec: int = 10) -> bool:
+    """True если лимит не превышен (5 сообщений за 10 секунд)."""
+    now = time.time()
+    _chat_ratelimit[user_id] = [t for t in _chat_ratelimit[user_id] if now - t < window_sec]
+    if len(_chat_ratelimit[user_id]) >= max_msgs:
+        return False
+    _chat_ratelimit[user_id].append(now)
+    return True
+
+async def require_uid(
+    uid: Optional[str] = Query(default=None),
+    init_data: Optional[str] = Query(default=None)
+) -> int:
+    # Верификация через Telegram initData (продакшен)
+    if init_data:
+        verified_id = verify_telegram_init_data(init_data)
+        if verified_id:
+            if not await db.get_user(verified_id):
+                await db.create_user(verified_id, "")
+            return verified_id
+    # Фоллбэк по uid (для разработки)
     if not uid or not uid.isdigit():
         raise HTTPException(401, "Unauthorized")
     user_id = int(uid)
@@ -146,6 +194,12 @@ async def create_product(
     if category not in CATEGORIES: raise HTTPException(400,"Неверная категория")
     if not title or len(title)>100: raise HTTPException(400,"Название от 1 до 100 символов")
     if price!=0 and price<MIN_PRICE: raise HTTPException(400,f"Минимальная цена {MIN_PRICE} ₽")
+    # Лимит товаров у продавца
+    async with aiosqlite.connect(DB_PATH) as d:
+        async with d.execute("SELECT COUNT(*) FROM products WHERE seller_id=? AND status='active'",(uid,)) as c:
+            row = await c.fetchone()
+            if row and row[0] >= 50:
+                raise HTTPException(400,"Максимум 50 активных товаров")
     if is_premium:
         balance = await db.get_balance(uid)
         if balance<PREMIUM_PRICE:
@@ -289,25 +343,18 @@ async def get_me(uid: int = Query(...)):
     if not await db.get_user(uid): await db.create_user(uid,"")
     u = await db.get_user(uid)
     gender = ""
-    try:
-        async with aiosqlite.connect(DB_PATH) as d:
-            async with d.execute("SELECT gender FROM users WHERE user_id=?",(uid,)) as c:
-                row = await c.fetchone()
-                if row and row[0]: gender = row[0]
-    except: pass
     earn_bal = 0.0
-    try:
-        async with aiosqlite.connect(DB_PATH) as d:
-            async with d.execute("SELECT earn_balance FROM users WHERE user_id=?",(uid,)) as c:
-                row = await c.fetchone()
-                if row and row[0]: earn_bal = float(row[0])
-    except: pass
     avatar_url = ""
     try:
         async with aiosqlite.connect(DB_PATH) as d:
-            async with d.execute("SELECT avatar_url FROM users WHERE user_id=?",(uid,)) as c:
+            async with d.execute(
+                "SELECT gender, earn_balance, avatar_url FROM users WHERE user_id=?", (uid,)
+            ) as c:
                 row = await c.fetchone()
-                if row and row[0]: avatar_url = row[0]
+                if row:
+                    gender = row[0] or ""
+                    earn_bal = float(row[1]) if row[1] else 0.0
+                    avatar_url = row[2] or ""
     except: pass
     return {"uid":uid,"nickname":u["nickname"] if u else "",
             "age":u["age"] if u else None,"balance":float(u["balance"]) if u else 0.0,
@@ -320,7 +367,13 @@ async def update_me(
     age: int = Query(...), gender: str = Query(default="")
 ):
     if not nickname or len(nickname)>30: raise HTTPException(400,"Никнейм от 1 до 30 символов")
-    if age<1 or age>120: raise HTTPException(400,"Укажи реальный возраст")
+    if age<18 or age>120: raise HTTPException(400,"Минимальный возраст — 18 лет")
+    # Проверка уникальности никнейма
+    async with aiosqlite.connect(DB_PATH) as d:
+        d.row_factory = aiosqlite.Row
+        async with d.execute("SELECT user_id FROM users WHERE nickname=? AND user_id!=?",(nickname,uid)) as c:
+            if await c.fetchone():
+                raise HTTPException(400,"Этот никнейм уже занят")
     u = await db.get_user(uid)
     await db.update_profile(uid,nickname,age,u["avatar_id"] if u else None)
     try:
@@ -570,7 +623,7 @@ async def support_send(uid: int = Query(...), message: str = Query(...)):
             (uid, message.strip()))
         await d.commit()
     u = await db.get_user(uid)
-    asyncio.ensure_future(notify(ADMIN_ID,
+    asyncio.create_task(notify(ADMIN_ID,
         f"[SUPPORT] {nick_of(u)} (ID:{uid}): {message.strip()[:100]}"))
     return {"ok": True}
 
@@ -582,7 +635,7 @@ async def support_reply(uid: int = Query(...), user_id: int = Query(...), messag
         await d.execute("INSERT INTO support_chat (user_id,from_admin,message) VALUES (?,1,?)",
             (user_id, message.strip()))
         await d.commit()
-    asyncio.ensure_future(notify(user_id, f"[Поддержка] {message.strip()[:100]}"))
+    asyncio.create_task(notify(user_id, f"[Поддержка] {message.strip()[:100]}"))
     return {"ok": True}
 
 @app.get("/support/tickets")
@@ -637,7 +690,7 @@ async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
             await d.commit()
         except: pass
     u = await db.get_user(uid)
-    asyncio.ensure_future(notify(friend_id, f"[Заявка] {nick_of(u)} хочет добавить вас в друзья"))
+    asyncio.create_task(notify(friend_id, f"[Заявка] {nick_of(u)} хочет добавить вас в друзья"))
     return {"ok": True}
 
 @app.get("/friends/cancel")
@@ -660,17 +713,7 @@ async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
             await d.execute("UPDATE friends SET status='accepted' WHERE user_id=? AND friend_id=?",(uid,friend_id))
         await d.commit()
     u = await db.get_user(uid)
-    asyncio.ensure_future(notify(friend_id, f"[Друзья] {nick_of(u)} принял вашу заявку"))
-    return {"ok": True}
-
-@app.get("/friends/cancel")
-async def cancel_friend_request(uid: int = Query(...), friend_id: int = Query(...)):
-    async with aiosqlite.connect(DB_PATH) as d:
-        await d.execute(
-            "DELETE FROM friends WHERE user_id=? AND friend_id=? AND status='pending'",
-            (uid, friend_id)
-        )
-        await d.commit()
+    asyncio.create_task(notify(friend_id, f"[Друзья] {nick_of(u)} принял вашу заявку"))
     return {"ok": True}
 
 @app.get("/friends/remove")
@@ -740,6 +783,8 @@ async def chat_messages(limit: int = Query(default=50)):
 async def chat_send(uid: int = Query(...), message: str = Query(...)):
     if not message.strip(): raise HTTPException(400,"Пустое сообщение")
     if len(message) > 500: raise HTTPException(400,"Максимум 500 символов")
+    if not check_rate_limit(uid):
+        raise HTTPException(429,"Слишком много сообщений. Подожди немного")
     u = await db.get_user(uid)
     nickname = nick_of(u)
     try:
@@ -802,7 +847,7 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
         ) as c:
             is_muted = await c.fetchone()
     if not is_muted:
-        asyncio.ensure_future(notify(to_id, f"[Сообщение] {nick_of(me)}: {message.strip()[:80]}"))
+        asyncio.create_task(notify(to_id, f"[Сообщение] {nick_of(me)}: {message.strip()[:80]}"))
     return {"ok": True}
 
 @app.get("/dm/mute")
@@ -905,11 +950,10 @@ async def dm_delete(uid: int = Query(...), with_id: int = Query(...), both_sides
                 (uid, with_id, with_id, uid)
             )
         else:
-            # Удаляем только у себя — помечаем как deleted_by
-            # Простой вариант: просто удаляем где ты отправитель или получатель
+            # Удаляем только исходящие сообщения от себя
             await d.execute(
-                "DELETE FROM dm_messages WHERE (from_id=? AND to_id=?) OR (to_id=? AND from_id=?)",
-                (uid, with_id, uid, with_id)
+                "DELETE FROM dm_messages WHERE from_id=? AND to_id=?",
+                (uid, with_id)
             )
         await d.commit()
     return {"ok": True}
