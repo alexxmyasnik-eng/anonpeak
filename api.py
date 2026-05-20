@@ -17,18 +17,11 @@ import database as db
 # Настройка часового пояса (МСК, UTC+3)
 MSK = timezone(timedelta(hours=3))
 
-try:
-    from config import BOT_TOKEN, ADMIN_ID, DA_LINK, DB_PATH
-except ImportError:
-    BOT_TOKEN = ""
-    ADMIN_ID = 0; DA_LINK = "https://donationalerts.com"; DB_PATH = "bot.db"
-
-SELL_COMM     = 0.16
-WITHDRAW_COMM = 0.05
-STAR_RATE     = 1.4
-PREMIUM_PRICE = 9
-MIN_PRICE     = 15
-MIN_WITHDRAW  = 100
+from config import (
+    BOT_TOKEN, ADMIN_ID, DA_LINK, DB_PATH,
+    SELL_COMM, WITHDRAW_COMM, STAR_RATE,
+    PREMIUM_PRICE, MIN_PRICE, MIN_WITHDRAW
+)
 
 CATEGORIES = {
     "photos":    {"name": "📸 Фото",       "subs": ["В белье","Без белья","Игрушки","Тематика"]},
