@@ -1,20 +1,21 @@
 import aiosqlite
+import secrets
 from config import DB_PATH
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id      INTEGER PRIMARY KEY,
-            username     TEXT,
-            nickname     TEXT,
-            age          INTEGER,
-            avatar_id    TEXT,
-            balance      REAL DEFAULT 0,
-            is_adult     INTEGER DEFAULT 1,
-            is_banned    INTEGER DEFAULT 0,
+            user_id       INTEGER PRIMARY KEY,
+            username      TEXT,
+            nickname      TEXT,
+            age           INTEGER,
+            avatar_id     TEXT,
+            balance       REAL DEFAULT 0,
+            is_adult      INTEGER DEFAULT 1,
+            is_banned     INTEGER DEFAULT 0,
             last_chat_msg TIMESTAMP,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS products (
@@ -99,8 +100,105 @@ async def init_db():
             message      TEXT NOT NULL,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS global_chat (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            nickname   TEXT,
+            message    TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS support_chat (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            from_admin INTEGER DEFAULT 0,
+            message    TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS friends (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            friend_id  INTEGER,
+            status     TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, friend_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS muted_users (
+            user_id  INTEGER,
+            muted_id INTEGER,
+            PRIMARY KEY(user_id, muted_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS transactions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            type        TEXT,
+            amount      REAL,
+            description TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS frozen_funds (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            order_id    INTEGER,
+            amount      REAL,
+            unfreeze_at TIMESTAMP,
+            is_released INTEGER DEFAULT 0,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS dm_messages (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_id       INTEGER,
+            to_id         INTEGER,
+            message       TEXT,
+            reply_to_text TEXT DEFAULT '',
+            is_read       INTEGER DEFAULT 0,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """)
+
+        # Индексы для производительности
+        await db.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_products_seller   ON products(seller_id);
+        CREATE INDEX IF NOT EXISTS idx_products_category ON products(category, status);
+        CREATE INDEX IF NOT EXISTS idx_orders_buyer      ON orders(buyer_id);
+        CREATE INDEX IF NOT EXISTS idx_orders_seller     ON orders(seller_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_order    ON messages(order_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id, is_read);
+        CREATE INDEX IF NOT EXISTS idx_dm_parties        ON dm_messages(from_id, to_id);
+        CREATE INDEX IF NOT EXISTS idx_dm_to_unread      ON dm_messages(to_id, is_read);
+        CREATE INDEX IF NOT EXISTS idx_global_chat_time  ON global_chat(created_at);
+        CREATE INDEX IF NOT EXISTS idx_friends_user      ON friends(user_id, status);
+        CREATE INDEX IF NOT EXISTS idx_friends_friend    ON friends(friend_id, status);
+        CREATE INDEX IF NOT EXISTS idx_frozen_user       ON frozen_funds(user_id, is_released);
+        CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, created_at);
+        """)
+
+        # Миграции — добавляем колонки если их нет (безопасно при повторном запуске)
+        migrations = [
+            "ALTER TABLE users    ADD COLUMN gender       TEXT DEFAULT ''",
+            "ALTER TABLE users    ADD COLUMN earn_balance REAL DEFAULT 0",
+            "ALTER TABLE users    ADD COLUMN avatar_url   TEXT DEFAULT ''",
+            "ALTER TABLE products ADD COLUMN subcategory  TEXT DEFAULT ''",
+            "ALTER TABLE products ADD COLUMN preview_url  TEXT DEFAULT ''",
+            "ALTER TABLE products ADD COLUMN delivery_files TEXT DEFAULT '[]'",
+            "ALTER TABLE products ADD COLUMN is_premium   INTEGER DEFAULT 0",
+            "ALTER TABLE products ADD COLUMN premium_at   TIMESTAMP",
+            "ALTER TABLE dm_messages ADD COLUMN reply_to_text TEXT DEFAULT ''",
+        ]
+        for sql in migrations:
+            try:
+                await db.execute(sql)
+            except Exception:
+                pass  # колонка уже существует — это нормально
+
         await db.commit()
+
 
 # ─── USERS ───────────────────────────────────────────────
 
@@ -112,7 +210,10 @@ async def get_user(user_id: int):
 
 async def create_user(user_id: int, username: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)", (user_id, username))
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)",
+            (user_id, username)
+        )
         await db.commit()
 
 async def set_adult(user_id: int):
@@ -132,33 +233,54 @@ async def get_balance(user_id: int) -> float:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)) as c:
             row = await c.fetchone()
-            return row[0] if row else 0.0
+            return float(row[0]) if row and row[0] is not None else 0.0
 
-async def change_balance(user_id: int, delta: float):
+async def change_balance(user_id: int, delta: float) -> bool:
+    """
+    Изменяет баланс пользователя.
+    При отрицательном delta проверяет что средств достаточно.
+    Возвращает True если успешно, False если недостаточно средств.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (delta, user_id))
+        if delta < 0:
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id=?", (user_id,)
+            ) as c:
+                row = await c.fetchone()
+            current = float(row[0]) if row and row[0] is not None else 0.0
+            if current + delta < 0:
+                return False
+        await db.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id=?",
+            (delta, user_id)
+        )
         await db.commit()
+        return True
 
 async def update_last_chat(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET last_chat_msg = CURRENT_TIMESTAMP WHERE user_id=?", (user_id,)
+            "UPDATE users SET last_chat_msg = CURRENT_TIMESTAMP WHERE user_id=?",
+            (user_id,)
         )
         await db.commit()
 
 async def get_last_chat_time(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT last_chat_msg FROM users WHERE user_id=?", (user_id,)) as c:
+        async with db.execute(
+            "SELECT last_chat_msg FROM users WHERE user_id=?", (user_id,)
+        ) as c:
             row = await c.fetchone()
             return row[0] if row else None
 
+
 # ─── PRODUCTS ────────────────────────────────────────────
 
-# СТАЛО:
 async def add_product(seller_id, category, title, description, price, media_id, media_type):
     async with aiosqlite.connect(DB_PATH) as db:
         c = await db.execute(
-            "INSERT INTO products (seller_id,category,title,description,price,media_id,media_type) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO products (seller_id,category,title,description,price,media_id,media_type) "
+            "VALUES (?,?,?,?,?,?,?)",
             (seller_id, category, title, description, price, media_id, media_type)
         )
         await db.commit()
@@ -168,7 +290,8 @@ async def get_products_by_category(category: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM products WHERE category=? AND status='active' ORDER BY created_at DESC", (category,)
+            "SELECT * FROM products WHERE category=? AND status='active' ORDER BY created_at DESC",
+            (category,)
         ) as c:
             return await c.fetchall()
 
@@ -182,16 +305,19 @@ async def get_my_products(seller_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM products WHERE seller_id=? ORDER BY created_at DESC", (seller_id,)
+            "SELECT * FROM products WHERE seller_id=? ORDER BY created_at DESC",
+            (seller_id,)
         ) as c:
             return await c.fetchall()
 
 async def delete_product(product_id: int, seller_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE products SET status='deleted' WHERE id=? AND seller_id=?", (product_id, seller_id)
+            "UPDATE products SET status='deleted' WHERE id=? AND seller_id=?",
+            (product_id, seller_id)
         )
         await db.commit()
+
 
 # ─── ORDERS ──────────────────────────────────────────────
 
@@ -209,7 +335,8 @@ async def create_order(buyer_id, seller_id, product_id, amount, commission, da_c
     async with aiosqlite.connect(DB_PATH) as db:
         short_id = await _gen_short_id(db)
         c = await db.execute(
-            "INSERT INTO orders (short_id,buyer_id,seller_id,product_id,amount,commission,da_comment) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO orders (short_id,buyer_id,seller_id,product_id,amount,commission,da_comment) "
+            "VALUES (?,?,?,?,?,?,?)",
             (short_id, buyer_id, seller_id, product_id, amount, commission, da_comment)
         )
         await db.commit()
@@ -235,12 +362,14 @@ async def get_orders_for_user(user_id: int):
         ) as c:
             return await c.fetchall()
 
+
 # ─── MESSAGES (личка по заказу) ──────────────────────────
 
 async def send_msg(order_id, sender_id, receiver_id, text=None, media_id=None, media_type=None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO messages (order_id,sender_id,receiver_id,text,media_id,media_type) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO messages (order_id,sender_id,receiver_id,text,media_id,media_type) "
+            "VALUES (?,?,?,?,?,?)",
             (order_id, sender_id, receiver_id, text, media_id, media_type)
         )
         await db.commit()
@@ -249,7 +378,8 @@ async def get_order_messages(order_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM messages WHERE order_id=? ORDER BY created_at ASC", (order_id,)
+            "SELECT * FROM messages WHERE order_id=? ORDER BY created_at ASC",
+            (order_id,)
         ) as c:
             return await c.fetchall()
 
@@ -264,13 +394,13 @@ async def mark_read(order_id: int, reader_id: int):
 async def count_unread(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT COUNT(*) FROM messages WHERE receiver_id=? AND is_read=0", (user_id,)
+            "SELECT COUNT(*) FROM messages WHERE receiver_id=? AND is_read=0",
+            (user_id,)
         ) as c:
             row = await c.fetchone()
             return row[0] if row else 0
 
 async def get_active_order_between(user_a: int, user_b: int):
-    """Найти активный заказ между двумя пользователями"""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -281,12 +411,14 @@ async def get_active_order_between(user_a: int, user_b: int):
         ) as c:
             return await c.fetchone()
 
+
 # ─── REVIEWS ─────────────────────────────────────────────
 
 async def add_review(order_id, seller_id, buyer_id, rating, text):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO reviews (order_id,seller_id,buyer_id,rating,text) VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO reviews (order_id,seller_id,buyer_id,rating,text) "
+            "VALUES (?,?,?,?,?)",
             (order_id, seller_id, buyer_id, rating, text)
         )
         await db.commit()
@@ -296,7 +428,8 @@ async def get_seller_reviews(seller_id: int):
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT r.*, u.nickname as buyer_name FROM reviews r "
-            "JOIN users u ON r.buyer_id=u.user_id WHERE r.seller_id=? ORDER BY r.created_at DESC",
+            "JOIN users u ON r.buyer_id=u.user_id "
+            "WHERE r.seller_id=? ORDER BY r.created_at DESC",
             (seller_id,)
         ) as c:
             return await c.fetchall()
@@ -304,16 +437,21 @@ async def get_seller_reviews(seller_id: int):
 async def get_seller_rating(seller_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT AVG(rating), COUNT(*) FROM reviews WHERE seller_id=?", (seller_id,)
+            "SELECT AVG(rating), COUNT(*) FROM reviews WHERE seller_id=?",
+            (seller_id,)
         ) as c:
             row = await c.fetchone()
-            return (round(row[0], 1) if row[0] else 0), (row[1] if row[1] else 0)
+            return (round(row[0], 1) if row[0] else 0.0), (row[1] if row[1] else 0)
+
 
 # ─── WITHDRAWALS ─────────────────────────────────────────
 
 async def create_withdrawal(user_id: int, amount: float):
     async with aiosqlite.connect(DB_PATH) as db:
-        c = await db.execute("INSERT INTO withdrawals (user_id, amount) VALUES (?,?)", (user_id, amount))
+        c = await db.execute(
+            "INSERT INTO withdrawals (user_id, amount) VALUES (?,?)",
+            (user_id, amount)
+        )
         await db.commit()
         return c.lastrowid
 
@@ -331,30 +469,35 @@ async def complete_withdrawal(w_id: int):
         await db.execute("UPDATE withdrawals SET status='done' WHERE id=?", (w_id,))
         await db.commit()
 
-# ─── DM TOKENS (анонимные ссылки) ────────────────────────
 
-import secrets
+# ─── DM TOKENS ───────────────────────────────────────────
 
 async def get_or_create_dm_token(user_id: int) -> str:
-    """Возвращает существующий токен или создаёт новый."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT token FROM dm_tokens WHERE user_id=?", (user_id,)) as c:
+        async with db.execute(
+            "SELECT token FROM dm_tokens WHERE user_id=?", (user_id,)
+        ) as c:
             row = await c.fetchone()
         if row:
             return row["token"]
         token = secrets.token_urlsafe(12)
-        await db.execute("INSERT INTO dm_tokens (token, user_id) VALUES (?,?)", (token, user_id))
+        await db.execute(
+            "INSERT INTO dm_tokens (token, user_id) VALUES (?,?)",
+            (token, user_id)
+        )
         await db.commit()
         return token
 
 async def get_user_by_dm_token(token: str):
-    """Возвращает user_id по токену или None."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT user_id FROM dm_tokens WHERE token=?", (token,)) as c:
+        async with db.execute(
+            "SELECT user_id FROM dm_tokens WHERE token=?", (token,)
+        ) as c:
             row = await c.fetchone()
         return row["user_id"] if row else None
+
 
 # ─── TOPUPS ──────────────────────────────────────────────
 
@@ -368,7 +511,6 @@ async def create_topup(user_id: int, amount: float, da_comment: str) -> int:
         return c.lastrowid
 
 async def get_pending_topups() -> list:
-    """Все топапы в статусе pending — для фонового polling."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -387,7 +529,6 @@ async def cancel_topup(topup_id: int):
         await db.commit()
 
 async def get_pending_orders_for_payment() -> list:
-    """Все заказы в статусе pending_payment — для фонового polling."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -418,6 +559,7 @@ async def is_donation_used(donation_id: int) -> bool:
             "SELECT 1 FROM used_donation_ids WHERE donation_id=?", (donation_id,)
         ) as c:
             return (await c.fetchone()) is not None
+
 
 # ─── SUPPORT ─────────────────────────────────────────────
 
