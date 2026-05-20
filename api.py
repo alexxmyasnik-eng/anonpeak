@@ -802,7 +802,27 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
         )
         await d.commit()
     me = await db.get_user(uid)
-    asyncio.ensure_future(notify(to_id, f"[Сообщение] {nick_of(me)}: {message.strip()[:80]}"))
+    # Проверяем, замутил ли получатель отправителя
+    async with aiosqlite.connect(DB_PATH) as d:
+        async with d.execute(
+            "SELECT 1 FROM muted_users WHERE user_id=? AND muted_id=?", (to_id, uid)
+        ) as c:
+            is_muted = await c.fetchone()
+    if not is_muted:
+        asyncio.ensure_future(notify(to_id, f"[Сообщение] {nick_of(me)}: {message.strip()[:80]}"))
+    return {"ok": True}
+
+@app.get("/dm/mute")
+async def dm_mute(uid: int = Query(...), muted_id: int = Query(...), until_ts: int = Query(default=0)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        if until_ts == -1:
+            await d.execute("DELETE FROM muted_users WHERE user_id=? AND muted_id=?", (uid, muted_id))
+        else:
+            await d.execute(
+                "INSERT OR REPLACE INTO muted_users (user_id, muted_id) VALUES (?,?)",
+                (uid, muted_id)
+            )
+        await d.commit()
     return {"ok": True}
 
 @app.get("/dm/messages")
