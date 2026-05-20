@@ -134,7 +134,7 @@ async def require_uid(uid: Optional[str] = Query(default=None)) -> int:
     return user_id
 
 # ── HEALTH ───────────────────────────────────────────────
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health(): return {"ok": True}
 
 # ── CATEGORIES ───────────────────────────────────────────
