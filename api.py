@@ -90,6 +90,7 @@ async def migrate():
             "ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''",
             "ALTER TABLE products ADD COLUMN preview_url TEXT DEFAULT ''",
             "ALTER TABLE products ADD COLUMN delivery_files TEXT DEFAULT '[]'",
+            "ALTER TABLE dm_messages ADD COLUMN reply_to_text TEXT DEFAULT ''",
         ]:
             try: await d.execute(sql)
             except: pass
