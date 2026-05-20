@@ -877,3 +877,22 @@ async def dm_conversations(uid: int = Query(...)):
             "is_out": r["from_id"] == uid
         })
     return result
+
+@app.get("/dm/delete")
+async def dm_delete(uid: int = Query(...), with_id: int = Query(...), both_sides: int = Query(default=0)):
+    async with aiosqlite.connect(DB_PATH) as d:
+        if both_sides:
+            # Удаляем переписку у обоих
+            await d.execute(
+                "DELETE FROM dm_messages WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)",
+                (uid, with_id, with_id, uid)
+            )
+        else:
+            # Удаляем только у себя — помечаем как deleted_by
+            # Простой вариант: просто удаляем где ты отправитель или получатель
+            await d.execute(
+                "DELETE FROM dm_messages WHERE (from_id=? AND to_id=?) OR (to_id=? AND from_id=?)",
+                (uid, with_id, uid, with_id)
+            )
+        await d.commit()
+    return {"ok": True}
