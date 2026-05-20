@@ -42,6 +42,7 @@ CATEGORIES = {
 async def migrate():
     async with aiosqlite.connect(DB_PATH) as d:
         for sql in [
+            "ALTER TABLE dm_messages ADD COLUMN reply_to_text TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN gender TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN earn_balance REAL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''",
@@ -794,9 +795,10 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
         except: pass
+        reply_to_text = request.query_params.get("reply_to_text", "")
         await d.execute(
-            "INSERT INTO dm_messages (from_id,to_id,message) VALUES (?,?,?)",
-            (uid, to_id, message.strip())
+            "INSERT INTO dm_messages (from_id,to_id,message,reply_to_text) VALUES (?,?,?,?)",
+            (uid, to_id, message.strip(), reply_to_text.strip())
         )
         await d.commit()
     me = await db.get_user(uid)
@@ -825,6 +827,7 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
             (uid, with_id, with_id, uid)
         ) as c: rows = await c.fetchall()
     return [{"id":r["id"],"from_id":r["from_id"],"message":r["message"],
+             "reply_to_text":r["reply_to_text"] if "reply_to_text" in dict(r) else "",
              "is_read":bool(r["is_read"]),"created_at":str(r["created_at"])} for r in rows]
 
 @app.get("/dm/unread_count")
