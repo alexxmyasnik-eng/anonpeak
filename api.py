@@ -813,6 +813,7 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
             await d.execute("""CREATE TABLE IF NOT EXISTS dm_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_id INTEGER, to_id INTEGER, message TEXT,
+                reply_to_text TEXT DEFAULT '',
                 is_read INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
@@ -834,7 +835,7 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
 async def dm_unread(uid: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         try:
-            await d.execute("CREATE TABLE IF NOT EXISTS dm_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, message TEXT, is_read INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            await d.execute("CREATE TABLE IF NOT EXISTS dm_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, message TEXT, reply_to_text TEXT DEFAULT '', is_read INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             await d.commit()
         except: pass
         d.row_factory = aiosqlite.Row
