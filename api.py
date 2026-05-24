@@ -26,7 +26,7 @@ from config import (
 
 CATEGORIES = {
     "photos":    {"name": "📸 Фото",       "subs": ["Тематика"]},
-    "videos":    {"name": "🎬 Видео",       "subs": ["Кошки","Собаки"]},
+    "videos": {"name": "🎬 Видео", "subs": ["Кошки","Собаки"]},
     "domik":{"name": "⛓️ Домик",   "subs": ["Оценка"]},
     "fish":    {"name": "🧎 Рыба",      "subs": ["Лёгкие"]},
     "audio":     {"name": "🎧 Аудио",       "subs": ["Собака"]},
