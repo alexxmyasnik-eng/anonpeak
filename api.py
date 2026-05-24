@@ -11,22 +11,18 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 import database as db
-from db_neon import get_pool
+from db_neon import get_conn
 
-# Настройка часового пояса (МСК, UTC+3)
 MSK = timezone(timedelta(hours=3))
 
 from config import (
     BOT_TOKEN, ADMIN_ID, DA_LINK,
-    SELL_COMM, WITHDRAW_COMM, STAR_RATE,
-    PREMIUM_PRICE, MIN_PRICE, MIN_WITHDRAW,
+    MIN_PRICE, MIN_WITHDRAW,
     MEDIA_CHANNEL_ID
 )
 
-# Явно прописываем константы которых нет в старом config
 try:
     from config import SELL_COMM, WITHDRAW_COMM, STAR_RATE, PREMIUM_PRICE
 except ImportError:
@@ -47,7 +43,7 @@ CATEGORIES = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
+    yield  # соединения создаются по требованию, пул не нужен
 
 
 app = FastAPI(lifespan=lifespan)
@@ -87,17 +83,10 @@ async def notify(chat_id, text):
 
 
 async def upload_media_to_tg(data_url: str) -> str:
-    """
-    Принимает base64 data URL (data:image/jpeg;base64,... или data:video/mp4;base64,...).
-    Загружает файл в приватный MEDIA_CHANNEL_ID и возвращает TG file_id.
-    Если передан уже file_id (не data:) — возвращает как есть.
-    """
     if not data_url.startswith("data:"):
-        return data_url  # уже file_id
-
+        return data_url
     if not MEDIA_CHANNEL_ID:
-        raise HTTPException(500, "MEDIA_CHANNEL_ID не задан в переменных окружения")
-
+        raise HTTPException(500, "MEDIA_CHANNEL_ID не задан")
     header, b64 = data_url.split(",", 1)
     file_bytes = base64.b64decode(b64)
     is_video = "video" in header
@@ -105,40 +94,18 @@ async def upload_media_to_tg(data_url: str) -> str:
     field = "video" if is_video else "photo"
     content_type = "video/mp4" if is_video else "image/jpeg"
     filename = "file.mp4" if is_video else "file.jpg"
-
     async with aiohttp.ClientSession() as s:
         form = aiohttp.FormData()
         form.add_field("chat_id", str(MEDIA_CHANNEL_ID))
         form.add_field(field, file_bytes, filename=filename, content_type=content_type)
-        resp = await s.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=form
-        )
+        resp = await s.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=form)
         result = await resp.json()
-
     if not result.get("ok"):
         raise HTTPException(500, f"TG upload error: {result.get('description', result)}")
-
     msg = result["result"]
     if is_video:
         return msg["video"]["file_id"]
     return msg["photo"][-1]["file_id"]
-
-
-def verify_telegram_init_data(init_data: str) -> Optional[int]:
-    try:
-        parsed = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
-        received_hash = parsed.pop("hash", None)
-        if not received_hash:
-            return None
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        expected_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected_hash, received_hash):
-            return None
-        user_data = json.loads(parsed.get("user", "{}"))
-        return user_data.get("id")
-    except Exception:
-        return None
 
 
 _chat_ratelimit: dict = defaultdict(list)
@@ -153,24 +120,6 @@ def check_rate_limit(user_id: int, max_msgs: int = 5, window_sec: int = 10) -> b
     return True
 
 
-async def require_uid(
-    uid: Optional[str] = Query(default=None),
-    init_data: Optional[str] = Query(default=None)
-) -> int:
-    if init_data:
-        verified_id = verify_telegram_init_data(init_data)
-        if verified_id:
-            if not await db.get_user(verified_id):
-                await db.create_user(verified_id, "")
-            return verified_id
-    if not uid or not uid.isdigit():
-        raise HTTPException(401, "Unauthorized")
-    user_id = int(uid)
-    if not await db.get_user(user_id):
-        await db.create_user(user_id, "")
-    return user_id
-
-
 # ── HEALTH ───────────────────────────────────────────────
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health(): return {"ok": True}
@@ -179,7 +128,6 @@ async def health(): return {"ok": True}
 # ── TG FILE RESOLVER ─────────────────────────────────────
 @app.get("/tg_file")
 async def tg_file(file_id: str = Query(...)):
-    """Резолвит TG file_id → прямую ссылку на файл для фронта."""
     async with aiohttp.ClientSession() as s:
         resp = await s.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
@@ -210,8 +158,7 @@ async def create_product(
     if not title or len(title) > 100: raise HTTPException(400, "Название от 1 до 100 символов")
     if price != 0 and price < MIN_PRICE: raise HTTPException(400, f"Минимальная цена {MIN_PRICE} ₽")
 
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow(
             "SELECT COUNT(*) as cnt FROM products WHERE seller_id=$1 AND status='active'", uid
         )
@@ -226,11 +173,8 @@ async def create_product(
 
     product_id = await db.add_product(uid, category, title, description or "", price, None, None)
 
-    pool = await get_pool()
-    async with pool.acquire() as d:
-        await d.execute(
-            "UPDATE products SET subcategory=$1 WHERE id=$2", subcategory.strip(), product_id
-        )
+    async with get_conn() as d:
+        await d.execute("UPDATE products SET subcategory=$1 WHERE id=$2", subcategory.strip(), product_id)
         if is_premium:
             await d.execute(
                 "UPDATE products SET is_premium=1, premium_at=$1 WHERE id=$2",
@@ -241,8 +185,7 @@ async def create_product(
 
 @app.get("/products/delete")
 async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1", product_id)
         if not row: raise HTTPException(404, "Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
@@ -256,17 +199,13 @@ async def set_product_preview(product_id: int, uid: int = Query(...), request: R
     if not data_url.startswith("data:image/"):
         raise HTTPException(400, "Только изображения")
     if len(data_url) > 5_000_000:
-        raise HTTPException(400, "Файл слишком большой (макс 3.7 МБ)")
-
-    pool = await get_pool()
-    async with pool.acquire() as d:
+        raise HTTPException(400, "Файл слишком большой")
+    async with get_conn() as d:
         row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1", product_id)
         if not row: raise HTTPException(404, "Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
-
-    # Загружаем в TG, сохраняем file_id
     file_id = await upload_media_to_tg(data_url)
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute("UPDATE products SET preview_url=$1 WHERE id=$2", file_id, product_id)
     return {"ok": True, "file_id": file_id}
 
@@ -277,10 +216,8 @@ async def add_delivery_file(product_id: int, uid: int = Query(...), request: Req
     if not data_url.startswith("data:"):
         raise HTTPException(400, "Только изображения или видео")
     if len(data_url) > 5_000_000:
-        raise HTTPException(400, "Файл слишком большой (макс ~3.7 МБ)")
-
-    pool = await get_pool()
-    async with pool.acquire() as d:
+        raise HTTPException(400, "Файл слишком большой")
+    async with get_conn() as d:
         row = await d.fetchrow("SELECT seller_id, delivery_files FROM products WHERE id=$1", product_id)
         if not row: raise HTTPException(404, "Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
@@ -289,20 +226,16 @@ async def add_delivery_file(product_id: int, uid: int = Query(...), request: Req
         except:
             files = []
         if len(files) >= 20: raise HTTPException(400, "Максимум 20 файлов")
-
-    # Загружаем в TG
     file_id = await upload_media_to_tg(data_url)
     files.append(file_id)
-
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute("UPDATE products SET delivery_files=$1 WHERE id=$2", json.dumps(files), product_id)
     return {"ok": True, "file_id": file_id}
 
 
 @app.get("/products/{product_id}/delivery_files")
 async def get_product_delivery_files(product_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow("SELECT delivery_files FROM products WHERE id=$1", product_id)
         if not row: raise HTTPException(404, "Товар не найден")
         try:
@@ -315,8 +248,7 @@ async def get_product_delivery_files(product_id: int):
 @app.get("/products/{category}")
 async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
     if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         q = "SELECT * FROM products WHERE category=$1 AND status='active'"
         params = [category]
         idx = 2
@@ -329,7 +261,6 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
             params.append(seller)
         q += " ORDER BY COALESCE(is_premium,0) DESC, created_at DESC"
         rows = await d.fetch(q, *params)
-
     result = []
     for p in rows:
         s = await db.get_user(p["seller_id"])
@@ -370,8 +301,7 @@ async def get_product(product_id: int):
 async def get_me(uid: int = Query(...)):
     if not await db.get_user(uid): await db.create_user(uid, "")
     u = await db.get_user(uid)
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow(
             "SELECT gender, earn_balance, avatar_url FROM users WHERE user_id=$1", uid
         )
@@ -394,18 +324,14 @@ async def update_me(
 ):
     if not nickname or len(nickname) > 30: raise HTTPException(400, "Никнейм от 1 до 30 символов")
     if age < 18 or age > 120: raise HTTPException(400, "Минимальный возраст — 18 лет")
-
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow(
             "SELECT user_id FROM users WHERE nickname=$1 AND user_id!=$2", nickname, uid
         )
         if row: raise HTTPException(400, "Этот никнейм уже занят")
-
     u = await db.get_user(uid)
     await db.update_profile(uid, nickname, age, u["avatar_id"] if u else None)
-
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute("UPDATE users SET gender=$1 WHERE user_id=$2", gender, uid)
     return {"ok": True}
 
@@ -414,20 +340,14 @@ async def update_me(
 async def set_avatar_post(request: Request, uid: int = Query(...)):
     body = await request.body()
     avatar_data = body.decode('utf-8')[:15000000]
-    # Аватар — небольшое изображение, можно хранить в Neon как file_id или base64
-    # Если хочешь тоже через TG — раскомментируй строки ниже:
-    # if avatar_data.startswith("data:"):
-    #     avatar_data = await upload_media_to_tg(avatar_data)
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute("UPDATE users SET avatar_url=$1 WHERE user_id=$2", avatar_data, uid)
     return {"ok": True}
 
 
 @app.get("/me/set_avatar")
 async def set_avatar(uid: int = Query(...), avatar_url: str = Query(default="")):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute("UPDATE users SET avatar_url=$1 WHERE user_id=$2", avatar_url, uid)
     return {"ok": True}
 
@@ -437,8 +357,7 @@ async def get_user_profile(user_id: int):
     u = await db.get_user(user_id)
     if not u: raise HTTPException(404, "Не найден")
     avg, cnt = await db.get_seller_rating(user_id)
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow("SELECT gender, avatar_url FROM users WHERE user_id=$1", user_id)
     gender = row["gender"] or "" if row else ""
     avatar_url = row["avatar_url"] or "" if row else ""
@@ -458,7 +377,12 @@ async def get_orders(uid: int = Query(...)):
         pid = o["seller_id"] if o["buyer_id"] == uid else o["buyer_id"]
         partner = await db.get_user(pid)
         p = await db.get_product(o["product_id"])
-        unread = await db.count_unread(uid)
+        async with get_conn() as d:
+            row = await d.fetchrow(
+                "SELECT COUNT(*) as cnt FROM messages WHERE order_id=$1 AND receiver_id=$2 AND is_read=0",
+                o["id"], uid
+            )
+        unread = row["cnt"] if row else 0
         result.append({
             "id": o["id"], "short_id": o["short_id"] or f"#{o['id']}",
             "product_title": p["title"] if p else "Удалён", "amount": o["amount"],
@@ -525,8 +449,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if order["status"] not in ("paid", "seller_confirmed"): raise HTTPException(400, "Нельзя закрыть")
     seller_gets = round(order["amount"] - order["commission"], 2)
     unfreeze_at = (datetime.now(MSK) + timedelta(days=2)).isoformat()
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES ($1,$2,$3,$4)",
             order["seller_id"], order_id, seller_gets, unfreeze_at
@@ -555,8 +478,7 @@ async def withdraw(uid: int = Query(...), amount: float = Query(...), username: 
     stars = math.ceil(after / STAR_RATE)
     await db.change_balance(uid, -amount)
     w_id = await db.create_withdrawal(uid, amount)
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
             uid, "withdraw", -amount, f"Вывод ⭐{stars} · комиссия {round(amount * WITHDRAW_COMM, 2)} ₽"
@@ -571,10 +493,8 @@ async def withdraw(uid: int = Query(...), amount: float = Query(...), username: 
 # ── TRANSACTIONS ──────────────────────────────────────────
 @app.get("/transactions")
 async def get_transactions(uid: int = Query(...)):
-    pool = await get_pool()
     now = datetime.now(MSK).isoformat()
-    async with pool.acquire() as d:
-        # Разморозка средств
+    async with get_conn() as d:
         due = await d.fetch(
             "SELECT * FROM frozen_funds WHERE user_id=$1 AND is_released=0 AND unfreeze_at<=$2",
             uid, now
@@ -614,8 +534,7 @@ async def support(uid: int = Query(...), message: str = Query(...)):
 
 @app.get("/support/messages")
 async def support_messages(uid: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
             "SELECT * FROM support_chat WHERE user_id=$1 ORDER BY created_at ASC LIMIT 100", uid
         )
@@ -626,8 +545,7 @@ async def support_messages(uid: int = Query(...)):
 @app.get("/support/send")
 async def support_send(uid: int = Query(...), message: str = Query(...)):
     if not message.strip(): raise HTTPException(400, "Пустое")
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "INSERT INTO support_chat (user_id,from_admin,message) VALUES ($1,0,$2)",
             uid, message.strip()
@@ -642,8 +560,7 @@ async def support_send(uid: int = Query(...), message: str = Query(...)):
 async def support_reply(uid: int = Query(...), user_id: int = Query(...), message: str = Query(...)):
     if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
     if not message.strip(): raise HTTPException(400, "Пустое")
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "INSERT INTO support_chat (user_id,from_admin,message) VALUES ($1,1,$2)",
             user_id, message.strip()
@@ -655,8 +572,7 @@ async def support_reply(uid: int = Query(...), user_id: int = Query(...), messag
 @app.get("/support/tickets")
 async def support_tickets(uid: int = Query(...)):
     if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
             """SELECT user_id, MAX(created_at) as last_time,
                (SELECT message FROM support_chat s2 WHERE s2.user_id=s1.user_id ORDER BY created_at DESC LIMIT 1) as last_message
@@ -676,8 +592,7 @@ async def support_tickets(uid: int = Query(...)):
 # ── MY PRODUCTS ───────────────────────────────────────────
 @app.get("/my_products")
 async def my_products(uid: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
             "SELECT * FROM products WHERE seller_id=$1 AND status='active' ORDER BY created_at DESC", uid
         )
@@ -695,8 +610,7 @@ async def friends_alias(uid: int = Query(...)):
 @app.get("/friends/add")
 async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
     if uid == friend_id: raise HTTPException(400, "Нельзя добавить себя")
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "INSERT INTO friends (user_id,friend_id,status) VALUES ($1,$2,'pending') ON CONFLICT DO NOTHING",
             uid, friend_id
@@ -708,8 +622,7 @@ async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
 
 @app.get("/friends/cancel")
 async def cancel_friend(uid: int = Query(...), friend_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "DELETE FROM friends WHERE user_id=$1 AND friend_id=$2 AND status='pending'",
             uid, friend_id
@@ -719,8 +632,7 @@ async def cancel_friend(uid: int = Query(...), friend_id: int = Query(...)):
 
 @app.get("/friends/accept")
 async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "UPDATE friends SET status='accepted' WHERE user_id=$1 AND friend_id=$2",
             friend_id, uid
@@ -737,8 +649,7 @@ async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
 
 @app.get("/friends/remove")
 async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "DELETE FROM friends WHERE (user_id=$1 AND friend_id=$2) OR (user_id=$2 AND friend_id=$1)",
             uid, friend_id
@@ -748,11 +659,8 @@ async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
 
 @app.get("/friends/list")
 async def friends_list(uid: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
-        rows = await d.fetch(
-            "SELECT friend_id,status FROM friends WHERE user_id=$1", uid
-        )
+    async with get_conn() as d:
+        rows = await d.fetch("SELECT friend_id,status FROM friends WHERE user_id=$1", uid)
     result = []
     for r in rows:
         u = await db.get_user(r["friend_id"])
@@ -762,8 +670,7 @@ async def friends_list(uid: int = Query(...)):
 
 @app.get("/friends/requests")
 async def friend_requests(uid: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
             "SELECT user_id FROM friends WHERE friend_id=$1 AND status='pending'", uid
         )
@@ -776,8 +683,7 @@ async def friend_requests(uid: int = Query(...)):
 
 @app.get("/friends/status")
 async def friend_status(uid: int = Query(...), other_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow(
             "SELECT status FROM friends WHERE user_id=$1 AND friend_id=$2", uid, other_id
         )
@@ -787,8 +693,7 @@ async def friend_status(uid: int = Query(...), other_id: int = Query(...)):
 # ── GLOBAL CHAT ───────────────────────────────────────────
 @app.get("/chat/messages")
 async def chat_messages(limit: int = Query(default=50)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
             "SELECT * FROM global_chat ORDER BY created_at DESC LIMIT $1", limit
         )
@@ -805,8 +710,7 @@ async def chat_send(uid: int = Query(...), message: str = Query(...)):
         raise HTTPException(429, "Слишком много сообщений. Подожди немного")
     u = await db.get_user(uid)
     nickname = nick_of(u)
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "INSERT INTO global_chat (user_id, nickname, message) VALUES ($1,$2,$3)",
             uid, nickname, message.strip()
@@ -816,8 +720,7 @@ async def chat_send(uid: int = Query(...), message: str = Query(...)):
 
 @app.get("/chat/delete")
 async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow("SELECT user_id FROM global_chat WHERE id=$1", msg_id)
         if not row: raise HTTPException(404, "Сообщение не найдено")
         if row["user_id"] != uid: raise HTTPException(403, "Нет доступа")
@@ -830,14 +733,12 @@ async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
 async def dm_send(uid: int = Query(...), to_id: int = Query(...),
                   message: str = Query(...), reply_to_text: str = Query(default="")):
     if not message.strip(): raise HTTPException(400, "Пустое сообщение")
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         row = await d.fetchrow(
             "SELECT status FROM friends WHERE user_id=$1 AND friend_id=$2", uid, to_id
         )
-    if not row or row["status"] != "accepted":
-        raise HTTPException(403, "Можно писать только друзьям")
-    async with pool.acquire() as d:
+        if not row or row["status"] != "accepted":
+            raise HTTPException(403, "Можно писать только друзьям")
         await d.execute(
             "INSERT INTO dm_messages (from_id,to_id,message,reply_to_text) VALUES ($1,$2,$3,$4)",
             uid, to_id, message.strip(), reply_to_text.strip()
@@ -853,8 +754,7 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...),
 
 @app.get("/dm/mute")
 async def dm_mute(uid: int = Query(...), muted_id: int = Query(...), until_ts: int = Query(default=0)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         if until_ts == -1:
             await d.execute("DELETE FROM muted_users WHERE user_id=$1 AND muted_id=$2", uid, muted_id)
         else:
@@ -867,8 +767,7 @@ async def dm_mute(uid: int = Query(...), muted_id: int = Query(...), until_ts: i
 
 @app.get("/dm/messages")
 async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         await d.execute(
             "UPDATE dm_messages SET is_read=1 WHERE to_id=$1 AND from_id=$2", uid, with_id
         )
@@ -885,8 +784,7 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
 
 @app.get("/dm/unread_count")
 async def dm_unread(uid: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
             "SELECT from_id, COUNT(*) as cnt FROM dm_messages WHERE to_id=$1 AND is_read=0 GROUP BY from_id",
             uid
@@ -896,34 +794,36 @@ async def dm_unread(uid: int = Query(...)):
 
 @app.get("/dm/conversations")
 async def dm_conversations(uid: int = Query(...)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         rows = await d.fetch(
-            """SELECT
+            """SELECT DISTINCT ON (partner_id)
                 CASE WHEN from_id=$1 THEN to_id ELSE from_id END as partner_id,
-                message, created_at, is_read, from_id,
-                COUNT(CASE WHEN to_id=$1 AND is_read=0 THEN 1 END) as unread
+                message, created_at, is_read, from_id
                FROM dm_messages
                WHERE from_id=$1 OR to_id=$1
-               GROUP BY partner_id, message, created_at, is_read, from_id
-               ORDER BY created_at DESC""",
+               ORDER BY partner_id, created_at DESC""",
             uid
         )
     result = []
     for r in rows:
         partner = await db.get_user(r["partner_id"])
+        async with get_conn() as d:
+            urow = await d.fetchrow(
+                "SELECT COUNT(*) as cnt FROM dm_messages WHERE to_id=$1 AND from_id=$2 AND is_read=0",
+                uid, r["partner_id"]
+            )
         result.append({
             "partner_id": r["partner_id"], "nickname": nick_of(partner),
             "last_message": r["message"], "created_at": str(r["created_at"]),
-            "unread": r["unread"], "is_out": r["from_id"] == uid
+            "unread": urow["cnt"] if urow else 0,
+            "is_out": r["from_id"] == uid
         })
     return result
 
 
 @app.get("/dm/delete")
 async def dm_delete(uid: int = Query(...), with_id: int = Query(...), both_sides: int = Query(default=0)):
-    pool = await get_pool()
-    async with pool.acquire() as d:
+    async with get_conn() as d:
         if both_sides:
             await d.execute(
                 "DELETE FROM dm_messages WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)",
