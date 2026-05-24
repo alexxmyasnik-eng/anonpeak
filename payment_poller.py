@@ -45,9 +45,9 @@ async def _process_topups(bot: Bot, donations: list, used_ids: set):
 
         # Атомарно: помечаем донат использованным И закрываем топап
         if don_id:
-            claimed = await db.try_claim_donation(don_id)
-            if not claimed:
+            if await db.is_donation_used(don_id):
                 continue  # уже использован другим процессом
+            await db.mark_donation_used(don_id)
             used_ids.add(don_id)  # обновляем локальный сет
 
         await db.complete_topup(topup["id"])
@@ -83,9 +83,9 @@ async def _process_orders(bot: Bot, donations: list, used_ids: set):
 
         # Атомарно: помечаем донат использованным
         if don_id:
-            claimed = await db.try_claim_donation(don_id)
-            if not claimed:
+            if await db.is_donation_used(don_id):
                 continue
+            await db.mark_donation_used(don_id)
             used_ids.add(don_id)
 
         await db.update_order_status(order["id"], "paid")
@@ -127,7 +127,6 @@ async def payment_polling_loop(bot: Bot):
         return
 
     logger.info("Запущен фоновый polling оплат (каждые 15 сек)")
-    cycle = 0
     while True:
         try:
             donations = await fetch_recent_donations(pages=3)
@@ -135,11 +134,6 @@ async def payment_polling_loop(bot: Bot):
                 used_ids = await db.get_used_donation_ids()
                 await _process_topups(bot, donations, used_ids)
                 await _process_orders(bot, donations, used_ids)
-            # Раз в час чистим старые donation IDs (каждые 240 циклов по 15 сек)
-            cycle += 1
-            if cycle % 240 == 0:
-                await db.cleanup_old_donations(days=30)
-                cycle = 0
         except Exception as e:
             logger.error(f"Ошибка polling: {e}")
 
