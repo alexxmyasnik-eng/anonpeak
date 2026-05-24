@@ -26,7 +26,7 @@ from config import (
 
 CATEGORIES = {
     "photos":    {"name": "📸 Фото",       "subs": ["Тематика"]},
-    "videos":    {"name": "🎬 Видео",       "subs": ["Кошки,"Собаки"]},
+    "videos":    {"name": "🎬 Видео",       "subs": ["Кошки","Собаки"]},
     "domik":{"name": "⛓️ Домик",   "subs": ["Оценка"]},
     "fish":    {"name": "🧎 Рыба",      "subs": ["Лёгкие"]},
     "audio":     {"name": "🎧 Аудио",       "subs": ["Собака"]},
@@ -86,7 +86,7 @@ async def migrate():
             "ALTER TABLE products ADD COLUMN delivery_files TEXT DEFAULT '[]'",
         ]:
             try: await d.execute(sql)
-            except: pass
+            except Exception: pass
         await d.commit()
 
 @asynccontextmanager
@@ -184,7 +184,7 @@ async def get_categories():
     return [{"id":k,"name":v["name"],"subs":v["subs"]} for k,v in CATEGORIES.items()]
 
 # ── PRODUCTS ─────────────────────────────────────────────
-@app.get("/products/create")
+@app.post("/products/create")
 async def create_product(
     uid: int = Query(...), title: str = Query(...),
     description: str = Query(default=""), price: float = Query(...),
@@ -208,7 +208,7 @@ async def create_product(
     product_id = await db.add_product(uid,category,title,description or "",price,None,None)
     async with aiosqlite.connect(DB_PATH) as d:
         try: await d.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
-        except: pass
+        except Exception: pass
         await d.execute("UPDATE products SET subcategory=? WHERE id=?",(subcategory.strip(),product_id))
         if is_premium:
             await d.execute("UPDATE products SET is_premium=1, premium_at=? WHERE id=?",
@@ -216,7 +216,7 @@ async def create_product(
         await d.commit()
     return {"ok":True,"product_id":product_id,"seller_gets":round(price*(1-SELL_COMM),2)}
 
-@app.get("/products/delete")
+@app.post("/products/delete")
 async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         d.row_factory = aiosqlite.Row
@@ -270,7 +270,23 @@ async def add_delivery_file(product_id: int, uid: int = Query(...), request: Req
     return {"ok": True}
 
 @app.get("/products/{product_id}/delivery_files")
-async def get_product_delivery_files(product_id: int):
+async def get_product_delivery_files(product_id: int, uid: int = Query(default=0)):
+    # Verify that uid has purchased this product
+    if uid:
+        async with aiosqlite.connect(DB_PATH) as d:
+            d.row_factory = aiosqlite.Row
+            async with d.execute(
+                "SELECT id FROM orders WHERE buyer_id=? AND product_id=? AND status IN ('paid','seller_confirmed','done')",
+                (uid, product_id)
+            ) as c:
+                purchase = await c.fetchone()
+            # Also allow seller to see their own files
+            async with d.execute("SELECT seller_id FROM products WHERE id=?", (product_id,)) as c:
+                prod = await c.fetchone()
+            if not purchase and (not prod or prod["seller_id"] != uid):
+                raise HTTPException(403, "Нет доступа: сначала купи товар")
+    else:
+        raise HTTPException(401, "Unauthorized")
     async with aiosqlite.connect(DB_PATH) as d:
         d.row_factory = aiosqlite.Row
         async with d.execute("SELECT delivery_files FROM products WHERE id=?", (product_id,)) as c:
@@ -287,7 +303,7 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
     if category not in CATEGORIES: raise HTTPException(404,"Не найдено")
     async with aiosqlite.connect(DB_PATH) as d:
         try: await d.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
-        except: pass
+        except Exception: pass
         await d.commit()
         d.row_factory = aiosqlite.Row
         q = "SELECT * FROM products WHERE category=? AND status='active'"
@@ -329,7 +345,7 @@ async def get_product(product_id: int):
             async with d.execute("SELECT preview_url FROM products WHERE id=?", (product_id,)) as c:
                 row = await c.fetchone()
                 if row and row[0]: prev_url = row[0]
-    except: pass
+    except Exception: pass
     return {"id":p["id"],"title":p["title"],"description":p["description"],
         "price":p["price"],"category":p["category"],"media_id":p["media_id"],
         "preview_url":prev_url,
@@ -355,13 +371,17 @@ async def get_me(uid: int = Query(...)):
                     gender = row[0] or ""
                     earn_bal = float(row[1]) if row[1] else 0.0
                     avatar_url = row[2] or ""
-    except: pass
+    except Exception: pass
     return {"uid":uid,"nickname":u["nickname"] if u else "",
-            "age":u["age"] if u else None,"balance":float(u["balance"]) if u else 0.0,
-            "earn_balance":earn_bal,"avatar_url":avatar_url,
-            "avatar_id":u["avatar_id"] if u else None,"gender":gender}
+            "age":u["age"] if u else None,
+            "balance":float(u["balance"]) if u else 0.0,
+            "earn_balance":earn_bal,
+            "total_balance":(float(u["balance"]) if u else 0.0) + earn_bal,
+            "avatar_url":avatar_url,
+            "avatar_id":u["avatar_id"] if u else None,"gender":gender,
+            "is_admin": uid == ADMIN_ID}
 
-@app.get("/me/update")
+@app.post("/me/update")
 async def update_me(
     uid: int = Query(...), nickname: str = Query(...),
     age: int = Query(...), gender: str = Query(default="")
@@ -380,7 +400,7 @@ async def update_me(
         async with aiosqlite.connect(DB_PATH) as d:
             await d.execute("UPDATE users SET gender=? WHERE user_id=?",(gender,uid))
             await d.commit()
-    except: pass
+    except Exception: pass
     return {"ok":True}
 
 # ── ORDERS ────────────────────────────────────────────────
@@ -400,7 +420,7 @@ async def get_orders(uid: int = Query(...)):
                     (o["id"],uid)
                 ) as c:
                     row = await c.fetchone(); unread = row[0] if row else 0
-        except: pass
+        except Exception: pass
         result.append({"id":o["id"],"short_id":o["short_id"] or f"#{o['id']}",
             "product_title":p["title"] if p else "Удалён","amount":o["amount"],
             "status":o["status"],"buyer_id":o["buyer_id"],"seller_id":o["seller_id"],
@@ -418,7 +438,7 @@ async def get_messages(order_id: int, uid: int = Query(...)):
     return [{"id":m["id"],"sender_id":m["sender_id"],"text":m["text"],
              "media_type":m["media_type"],"created_at":str(m["created_at"])} for m in msgs]
 
-@app.get("/send_msg")
+@app.post("/send_msg")
 async def send_msg(order_id: int = Query(...), uid: int = Query(...), text: str = Query(...)):
     if not text.strip(): raise HTTPException(400,"Пустое сообщение")
     order = await db.get_order(order_id)
@@ -432,7 +452,7 @@ async def send_msg(order_id: int = Query(...), uid: int = Query(...), text: str 
         f"💬 Сообщение от <b>{nick_of(me)}</b>\nЗаказ {short}: {text.strip()[:80]}"))
     return {"ok":True}
 
-@app.get("/buy")
+@app.post("/buy")
 async def buy(product_id: int = Query(...), uid: int = Query(...)):
     p = await db.get_product(product_id)
     if not p or p["status"]!="active": raise HTTPException(400,"Товар недоступен")
@@ -451,7 +471,7 @@ async def buy(product_id: int = Query(...), uid: int = Query(...)):
         f"💰 <b>Новый заказ!</b>\nПокупатель: {nick_of(buyer)}\nТовар: {p['title']}\nВы получите: {seller_gets} ₽\nЗаказ: {short}"))
     return {"ok":True,"short_id":short}
 
-@app.get("/confirm_order")
+@app.post("/confirm_order")
 async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     order = await db.get_order(order_id)
     if not order or order["buyer_id"]!=uid: raise HTTPException(403,"Нет доступа")
@@ -462,30 +482,35 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
         await d.execute(
             "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES (?,?,?,?)",
             (order["seller_id"], order_id, seller_gets, unfreeze_at))
+        # Записываем транзакцию для покупателя
+        await d.execute(
+            "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
+            (order["buyer_id"], "purchase", -order["amount"],
+             f"Покупка: {(await db.get_product(order['product_id']) or {}).get('title','товар')}"))
         await d.commit()
     await db.update_order_status(order_id,"done")
     asyncio.create_task(notify(order["seller_id"],
         f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
     return {"ok":True}
 
-@app.get("/topup/create")
+@app.post("/topup/create")
 async def topup_create(amount: int = Query(...), uid: int = Query(...)):
     if amount<10: raise HTTPException(400,"Минимум 10 ₽")
     code = gen_code()
     topup_id = await db.create_topup(uid,amount,code)
     return {"topup_id":topup_id,"code":code,"da_link":DA_LINK,"amount":amount}
 
-@app.get("/withdraw")
+@app.post("/withdraw")
 async def withdraw(
     uid: int = Query(...), amount: float = Query(...), username: str = Query(...)
 ):
     if amount<MIN_WITHDRAW: raise HTTPException(400,f"Минимум {MIN_WITHDRAW} ₽")
     if not username or not username.startswith("@"): raise HTTPException(400,"Укажи @username")
-    balance = await db.get_balance(uid)
-    if balance<amount: raise HTTPException(400,f"Недостаточно средств. Баланс: {balance:.0f} ₽")
+    earn_bal = await db.get_earn_balance(uid)
+    if earn_bal<amount: raise HTTPException(400,f"Недостаточно заработанных средств. Доступно: {earn_bal:.0f} ₽")
     after = round(amount*(1-WITHDRAW_COMM),2)
     stars = math.ceil(after/STAR_RATE)
-    await db.change_balance(uid,-amount)
+    await db.change_earn_balance(uid,-amount)
     w_id = await db.create_withdrawal(uid,amount)
     try:
         async with aiosqlite.connect(DB_PATH) as d:
@@ -493,7 +518,7 @@ async def withdraw(
                 "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
                 (uid, "withdraw", -amount, f"Вывод ⭐{stars} · комиссия {round(amount*WITHDRAW_COMM,2)} ₽"))
             await d.commit()
-    except: pass
+    except Exception: pass
     u = await db.get_user(uid)
     asyncio.create_task(notify(ADMIN_ID,
         f"💸 <b>Вывод #{w_id}</b>\n👤 {nick_of(u)} (ID:{uid})\n"
@@ -516,14 +541,15 @@ async def get_transactions(uid: int = Query(...)):
                 unfreeze_at TIMESTAMP, is_released INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
             await d.commit()
-        except: pass
+        except Exception: pass
         now = datetime.now(MSK).isoformat()
         async with d.execute(
             "SELECT * FROM frozen_funds WHERE user_id=? AND is_released=0 AND unfreeze_at<=?",
             (uid, now)
         ) as c: due = await c.fetchall()
         for f in due:
-            await db.change_balance(uid, f["amount"])
+            # Размороженные средства идут на earn_balance (заработанное — для вывода)
+            await db.change_earn_balance(uid, f["amount"])
             await d.execute("UPDATE frozen_funds SET is_released=1 WHERE id=?",(f["id"],))
             await d.execute(
                 "INSERT INTO transactions (user_id,type,amount,description) VALUES (?,?,?,?)",
@@ -566,7 +592,7 @@ async def set_avatar_post(request: Request, uid: int = Query(...)):
         avatar_data = body.decode('utf-8')[:15000000]
         async with aiosqlite.connect(DB_PATH) as d:
             try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
-            except: pass
+            except Exception: pass
             await d.execute("UPDATE users SET avatar_url=? WHERE user_id=?", (avatar_data, uid))
             await d.commit()
     except Exception as e:
@@ -578,7 +604,7 @@ async def set_avatar(uid: int = Query(...), avatar_url: str = Query(default=""))
     try:
         async with aiosqlite.connect(DB_PATH) as d:
             try: await d.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT ''")
-            except: pass
+            except Exception: pass
             await d.execute("UPDATE users SET avatar_url=? WHERE user_id=?", (avatar_url, uid))
             await d.commit()
     except Exception as e:
@@ -597,7 +623,7 @@ async def get_user_profile(user_id: int):
             async with d.execute("SELECT gender, avatar_url FROM users WHERE user_id=?",(user_id,)) as c:
                 row = await c.fetchone()
                 if row: gender, avatar_url = row[0] or "", row[1] or ""
-    except: pass
+    except Exception: pass
     return {
         "uid": user_id, "nickname": u["nickname"] or "Аноним",
         "age": u["age"], "gender": gender, "avatar_url": avatar_url,
@@ -615,7 +641,7 @@ async def support_messages(uid: int = Query(...)):
     return [{"id":r["id"],"from_admin":bool(r["from_admin"]),
              "message":r["message"],"created_at":str(r["created_at"])} for r in rows]
 
-@app.get("/support/send")
+@app.post("/support/send")
 async def support_send(uid: int = Query(...), message: str = Query(...)):
     if not message.strip(): raise HTTPException(400,"Пустое")
     async with aiosqlite.connect(DB_PATH) as d:
@@ -627,7 +653,7 @@ async def support_send(uid: int = Query(...), message: str = Query(...)):
         f"[SUPPORT] {nick_of(u)} (ID:{uid}): {message.strip()[:100]}"))
     return {"ok": True}
 
-@app.get("/support/reply")
+@app.post("/support/reply")
 async def support_reply(uid: int = Query(...), user_id: int = Query(...), message: str = Query(...)):
     if uid != ADMIN_ID: raise HTTPException(403,"Нет доступа")
     if not message.strip(): raise HTTPException(400,"Пустое")
@@ -666,7 +692,7 @@ async def support_tickets(uid: int = Query(...)):
 async def my_products(uid: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         try: await d.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
-        except: pass
+        except Exception: pass
         await d.commit()
         d.row_factory = aiosqlite.Row
         async with d.execute(
@@ -681,19 +707,19 @@ async def my_products(uid: int = Query(...)):
 async def friends_alias(uid: int = Query(...)):
     return await friends_list(uid=uid)
 
-@app.get("/friends/add")
+@app.post("/friends/add")
 async def add_friend(uid: int = Query(...), friend_id: int = Query(...)):
     if uid == friend_id: raise HTTPException(400,"Нельзя добавить себя")
     async with aiosqlite.connect(DB_PATH) as d:
         try:
             await d.execute("INSERT INTO friends (user_id,friend_id,status) VALUES (?,?,'pending')",(uid,friend_id))
             await d.commit()
-        except: pass
+        except Exception: pass
     u = await db.get_user(uid)
     asyncio.create_task(notify(friend_id, f"[Заявка] {nick_of(u)} хочет добавить вас в друзья"))
     return {"ok": True}
 
-@app.get("/friends/cancel")
+@app.post("/friends/cancel")
 async def cancel_friend(uid: int = Query(...), friend_id: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         await d.execute(
@@ -703,7 +729,7 @@ async def cancel_friend(uid: int = Query(...), friend_id: int = Query(...)):
         await d.commit()
     return {"ok": True}
 
-@app.get("/friends/accept")
+@app.post("/friends/accept")
 async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         await d.execute("UPDATE friends SET status='accepted' WHERE user_id=? AND friend_id=?",(friend_id,uid))
@@ -716,7 +742,7 @@ async def accept_friend(uid: int = Query(...), friend_id: int = Query(...)):
     asyncio.create_task(notify(friend_id, f"[Друзья] {nick_of(u)} принял вашу заявку"))
     return {"ok": True}
 
-@app.get("/friends/remove")
+@app.post("/friends/remove")
 async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         await d.execute(
@@ -769,7 +795,7 @@ async def chat_messages(limit: int = Query(default=50)):
             try:
                 await d.execute("CREATE TABLE IF NOT EXISTS global_chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, nickname TEXT, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
                 await d.commit()
-            except: pass
+            except Exception: pass
             async with d.execute(
                 "SELECT * FROM global_chat ORDER BY created_at DESC LIMIT ?", (limit,)
             ) as c:
@@ -779,7 +805,7 @@ async def chat_messages(limit: int = Query(default=50)):
     except Exception as e:
         return []
 
-@app.get("/chat/send")
+@app.post("/chat/send")
 async def chat_send(uid: int = Query(...), message: str = Query(...)):
     if not message.strip(): raise HTTPException(400,"Пустое сообщение")
     if len(message) > 500: raise HTTPException(400,"Максимум 500 символов")
@@ -791,7 +817,7 @@ async def chat_send(uid: int = Query(...), message: str = Query(...)):
         async with aiosqlite.connect(DB_PATH) as d:
             try:
                 await d.execute("CREATE TABLE IF NOT EXISTS global_chat (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, nickname TEXT, message TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-            except: pass
+            except Exception: pass
             await d.execute(
                 "INSERT INTO global_chat (user_id, nickname, message) VALUES (?,?,?)",
                 (uid, nickname, message.strip())
@@ -801,7 +827,7 @@ async def chat_send(uid: int = Query(...), message: str = Query(...)):
         raise HTTPException(500, str(e))
     return {"ok": True}
 
-@app.get("/chat/delete")
+@app.post("/chat/delete")
 async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
     async with aiosqlite.connect(DB_PATH) as d:
         d.row_factory = aiosqlite.Row
@@ -814,7 +840,7 @@ async def chat_delete(uid: int = Query(...), msg_id: int = Query(...)):
     return {"ok": True}
 
 # ── DIRECT MESSAGES ───────────────────────────────────────
-@app.get("/dm/send")
+@app.post("/dm/send")
 async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str = Query(...), reply_to_text: str = Query(default="")):
     if not message.strip(): raise HTTPException(400,"Пустое сообщение")
     async with aiosqlite.connect(DB_PATH) as d:
@@ -833,7 +859,7 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
                 is_read INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
-        except: pass
+        except Exception: pass
         await d.execute(
             "INSERT INTO dm_messages (from_id,to_id,message,reply_to_text) VALUES (?,?,?,?)",
             (uid, to_id, message.strip(), reply_to_text.strip())
@@ -850,7 +876,7 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...), message: str =
         asyncio.create_task(notify(to_id, f"[Сообщение] {nick_of(me)}: {message.strip()[:80]}"))
     return {"ok": True}
 
-@app.get("/dm/mute")
+@app.post("/dm/mute")
 async def dm_mute(uid: int = Query(...), muted_id: int = Query(...), until_ts: int = Query(default=0)):
     async with aiosqlite.connect(DB_PATH) as d:
         if until_ts == -1:
@@ -876,7 +902,7 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             await d.commit()
-        except: pass
+        except Exception: pass
         await d.execute(
             "UPDATE dm_messages SET is_read=1 WHERE to_id=? AND from_id=?", (uid, with_id)
         )
@@ -895,7 +921,7 @@ async def dm_unread(uid: int = Query(...)):
         try:
             await d.execute("CREATE TABLE IF NOT EXISTS dm_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, message TEXT, reply_to_text TEXT DEFAULT '', is_read INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
             await d.commit()
-        except: pass
+        except Exception: pass
         d.row_factory = aiosqlite.Row
         async with d.execute(
             "SELECT from_id, COUNT(*) as cnt FROM dm_messages WHERE to_id=? AND is_read=0 GROUP BY from_id", (uid,)
@@ -914,7 +940,7 @@ async def dm_conversations(uid: int = Query(...)):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             await d.commit()
-        except: pass
+        except Exception: pass
         # Получаем всех с кем была переписка + последнее сообщение
         async with d.execute("""
             SELECT 
@@ -940,7 +966,7 @@ async def dm_conversations(uid: int = Query(...)):
         })
     return result
 
-@app.get("/dm/delete")
+@app.post("/dm/delete")
 async def dm_delete(uid: int = Query(...), with_id: int = Query(...), both_sides: int = Query(default=0)):
     async with aiosqlite.connect(DB_PATH) as d:
         if both_sides:
