@@ -9,6 +9,7 @@ import logging
 from aiogram import Bot
 
 import database as db
+from db_neon import get_conn
 from da_checker import fetch_recent_donations
 from keyboards.inline import kb_wallet, kb_order_chat
 
