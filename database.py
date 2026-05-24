@@ -1,429 +1,383 @@
-import aiosqlite
-from config import DB_PATH
+"""
+database.py — полностью переписан под asyncpg (Neon PostgreSQL).
+Все ? заменены на $1,$2,...  Все aiosqlite.connect → pool.acquire().
+"""
+import secrets
+import random
+import string
+
+from db_neon import get_pool
+
+
+# ─── INIT (запускать один раз через Neon SQL Editor, не здесь) ───────────────
+# Таблицы создаются вручную в Neon → SQL Editor.
+# Скрипт для создания всех таблиц — см. инструкцию.
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id      INTEGER PRIMARY KEY,
-            username     TEXT,
-            nickname     TEXT,
-            age          INTEGER,
-            avatar_id    TEXT,
-            balance      REAL DEFAULT 0,
-            is_adult     INTEGER DEFAULT 1,
-            is_banned    INTEGER DEFAULT 0,
-            last_chat_msg TIMESTAMP,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+    """Ничего не делает — таблицы уже созданы в Neon."""
+    pass
 
-        CREATE TABLE IF NOT EXISTS products (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            seller_id    INTEGER,
-            category     TEXT,
-            title        TEXT,
-            description  TEXT,
-            price        REAL,
-            media_id     TEXT,
-            media_type   TEXT,
-            status       TEXT DEFAULT 'active',
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
 
-        CREATE TABLE IF NOT EXISTS orders (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            short_id     TEXT UNIQUE,
-            buyer_id     INTEGER,
-            seller_id    INTEGER,
-            product_id   INTEGER,
-            amount       REAL,
-            commission   REAL,
-            status       TEXT DEFAULT 'pending',
-            da_comment   TEXT,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS reviews (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id     INTEGER UNIQUE,
-            seller_id    INTEGER,
-            buyer_id     INTEGER,
-            rating       INTEGER,
-            text         TEXT,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS messages (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id     INTEGER,
-            sender_id    INTEGER,
-            receiver_id  INTEGER,
-            text         TEXT,
-            media_id     TEXT,
-            media_type   TEXT,
-            is_read      INTEGER DEFAULT 0,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id      INTEGER,
-            amount       REAL,
-            status       TEXT DEFAULT 'pending',
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS dm_tokens (
-            token        TEXT PRIMARY KEY,
-            user_id      INTEGER NOT NULL,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS topups (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id      INTEGER NOT NULL,
-            amount       REAL NOT NULL,
-            da_comment   TEXT NOT NULL,
-            status       TEXT DEFAULT 'pending',
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS used_donation_ids (
-            donation_id  INTEGER PRIMARY KEY,
-            used_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS support_tickets (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id      INTEGER NOT NULL,
-            message      TEXT NOT NULL,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-        await db.commit()
-
-# ─── USERS ───────────────────────────────────────────────
+# ─── USERS ───────────────────────────────────────────────────────────────────
 
 async def get_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)) as c:
-            return await c.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
 
 async def create_user(user_id: int, username: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)", (user_id, username))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute(
+            "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            user_id, username
+        )
+
 
 async def set_adult(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET is_adult=1 WHERE user_id=?", (user_id,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute("UPDATE users SET is_adult=1 WHERE user_id=$1", user_id)
+
 
 async def update_profile(user_id: int, nickname: str, age: int, avatar_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "UPDATE users SET nickname=?, age=?, avatar_id=? WHERE user_id=?",
-            (nickname, age, avatar_id, user_id)
+            "UPDATE users SET nickname=$1, age=$2, avatar_id=$3 WHERE user_id=$4",
+            nickname, age, avatar_id, user_id
         )
-        await db.commit()
+
 
 async def get_balance(user_id: int) -> float:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone()
-            return row[0] if row else 0.0
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow("SELECT balance FROM users WHERE user_id=$1", user_id)
+        return float(row["balance"]) if row else 0.0
+
 
 async def change_balance(user_id: int, delta: float):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (delta, user_id))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + $1 WHERE user_id=$2",
+            delta, user_id
+        )
+
 
 async def update_last_chat(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "UPDATE users SET last_chat_msg = CURRENT_TIMESTAMP WHERE user_id=?", (user_id,)
+            "UPDATE users SET last_chat_msg = NOW() WHERE user_id=$1", user_id
         )
-        await db.commit()
+
 
 async def get_last_chat_time(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT last_chat_msg FROM users WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone()
-            return row[0] if row else None
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow("SELECT last_chat_msg FROM users WHERE user_id=$1", user_id)
+        return row["last_chat_msg"] if row else None
 
-# ─── PRODUCTS ────────────────────────────────────────────
 
-async def add_product(seller_id, category, title, description, price, media_id, media_type):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO products (seller_id,category,title,description,price,media_id,media_type) VALUES (?,?,?,?,?,?,?)",
-            (seller_id, category, title, description, price, media_id, media_type)
+# ─── PRODUCTS ────────────────────────────────────────────────────────────────
+
+async def add_product(seller_id, category, title, description, price, media_id, media_type) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            """INSERT INTO products (seller_id,category,title,description,price,media_id,media_type)
+               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+            seller_id, category, title, description, price, media_id, media_type
         )
-        await db.commit()
+        return row["id"]
+
 
 async def get_products_by_category(category: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM products WHERE category=? AND status='active' ORDER BY created_at DESC", (category,)
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            "SELECT * FROM products WHERE category=$1 AND status='active' ORDER BY created_at DESC",
+            category
+        )
+
 
 async def get_product(product_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM products WHERE id=?", (product_id,)) as c:
-            return await c.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetchrow("SELECT * FROM products WHERE id=$1", product_id)
+
 
 async def get_my_products(seller_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM products WHERE seller_id=? ORDER BY created_at DESC", (seller_id,)
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            "SELECT * FROM products WHERE seller_id=$1 ORDER BY created_at DESC", seller_id
+        )
+
 
 async def delete_product(product_id: int, seller_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "UPDATE products SET status='deleted' WHERE id=? AND seller_id=?", (product_id, seller_id)
+            "UPDATE products SET status='deleted' WHERE id=$1 AND seller_id=$2",
+            product_id, seller_id
         )
-        await db.commit()
 
-# ─── ORDERS ──────────────────────────────────────────────
+
+# ─── ORDERS ──────────────────────────────────────────────────────────────────
 
 async def _gen_short_id(db) -> str:
-    import random, string
     chars = string.ascii_uppercase + string.digits
     for _ in range(20):
         sid = ''.join(random.choices(chars, k=6))
-        async with db.execute("SELECT id FROM orders WHERE short_id=?", (sid,)) as c:
-            if not await c.fetchone():
-                return sid
+        row = await db.fetchrow("SELECT id FROM orders WHERE short_id=$1", sid)
+        if not row:
+            return sid
     return ''.join(random.choices(chars, k=8))
 
-async def create_order(buyer_id, seller_id, product_id, amount, commission, da_comment=""):
-    async with aiosqlite.connect(DB_PATH) as db:
+
+async def create_order(buyer_id, seller_id, product_id, amount, commission, da_comment="") -> int:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         short_id = await _gen_short_id(db)
-        c = await db.execute(
-            "INSERT INTO orders (short_id,buyer_id,seller_id,product_id,amount,commission,da_comment) VALUES (?,?,?,?,?,?,?)",
-            (short_id, buyer_id, seller_id, product_id, amount, commission, da_comment)
+        row = await db.fetchrow(
+            """INSERT INTO orders (short_id,buyer_id,seller_id,product_id,amount,commission,da_comment)
+               VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+            short_id, buyer_id, seller_id, product_id, amount, commission, da_comment
         )
-        await db.commit()
-        return c.lastrowid
+        return row["id"]
+
 
 async def get_order(order_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM orders WHERE id=?", (order_id,)) as c:
-            return await c.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetchrow("SELECT * FROM orders WHERE id=$1", order_id)
+
 
 async def update_order_status(order_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute("UPDATE orders SET status=$1 WHERE id=$2", status, order_id)
+
 
 async def get_orders_for_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM orders WHERE buyer_id=? OR seller_id=? ORDER BY created_at DESC",
-            (user_id, user_id)
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            "SELECT * FROM orders WHERE buyer_id=$1 OR seller_id=$1 ORDER BY created_at DESC",
+            user_id
+        )
 
-# ─── MESSAGES (личка по заказу) ──────────────────────────
+
+async def get_pending_orders_for_payment() -> list:
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            "SELECT * FROM orders WHERE status='pending_payment' ORDER BY created_at ASC"
+        )
+
+
+# ─── MESSAGES (личка по заказу) ──────────────────────────────────────────────
 
 async def send_msg(order_id, sender_id, receiver_id, text=None, media_id=None, media_type=None):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "INSERT INTO messages (order_id,sender_id,receiver_id,text,media_id,media_type) VALUES (?,?,?,?,?,?)",
-            (order_id, sender_id, receiver_id, text, media_id, media_type)
+            "INSERT INTO messages (order_id,sender_id,receiver_id,text,media_id,media_type) VALUES ($1,$2,$3,$4,$5,$6)",
+            order_id, sender_id, receiver_id, text, media_id, media_type
         )
-        await db.commit()
+
 
 async def get_order_messages(order_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM messages WHERE order_id=? ORDER BY created_at ASC", (order_id,)
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            "SELECT * FROM messages WHERE order_id=$1 ORDER BY created_at ASC", order_id
+        )
+
 
 async def mark_read(order_id: int, reader_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "UPDATE messages SET is_read=1 WHERE order_id=? AND receiver_id=? AND is_read=0",
-            (order_id, reader_id)
+            "UPDATE messages SET is_read=1 WHERE order_id=$1 AND receiver_id=$2 AND is_read=0",
+            order_id, reader_id
         )
-        await db.commit()
+
 
 async def count_unread(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM messages WHERE receiver_id=? AND is_read=0", (user_id,)
-        ) as c:
-            row = await c.fetchone()
-            return row[0] if row else 0
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "SELECT COUNT(*) as cnt FROM messages WHERE receiver_id=$1 AND is_read=0", user_id
+        )
+        return row["cnt"] if row else 0
+
 
 async def get_active_order_between(user_a: int, user_b: int):
-    """Найти активный заказ между двумя пользователями"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetchrow(
             """SELECT * FROM orders WHERE status NOT IN ('done','cancelled')
-               AND ((buyer_id=? AND seller_id=?) OR (buyer_id=? AND seller_id=?))
+               AND ((buyer_id=$1 AND seller_id=$2) OR (buyer_id=$2 AND seller_id=$1))
                ORDER BY created_at DESC LIMIT 1""",
-            (user_a, user_b, user_b, user_a)
-        ) as c:
-            return await c.fetchone()
+            user_a, user_b
+        )
 
-# ─── REVIEWS ─────────────────────────────────────────────
+
+# ─── REVIEWS ─────────────────────────────────────────────────────────────────
 
 async def add_review(order_id, seller_id, buyer_id, rating, text):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO reviews (order_id,seller_id,buyer_id,rating,text) VALUES (?,?,?,?,?)",
-            (order_id, seller_id, buyer_id, rating, text)
+            """INSERT INTO reviews (order_id,seller_id,buyer_id,rating,text)
+               VALUES ($1,$2,$3,$4,$5)
+               ON CONFLICT (order_id) DO UPDATE SET rating=$4, text=$5""",
+            order_id, seller_id, buyer_id, rating, text
         )
-        await db.commit()
+
 
 async def get_seller_reviews(seller_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT r.*, u.nickname as buyer_name FROM reviews r "
-            "JOIN users u ON r.buyer_id=u.user_id WHERE r.seller_id=? ORDER BY r.created_at DESC",
-            (seller_id,)
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            """SELECT r.*, u.nickname as buyer_name FROM reviews r
+               JOIN users u ON r.buyer_id=u.user_id
+               WHERE r.seller_id=$1 ORDER BY r.created_at DESC""",
+            seller_id
+        )
+
 
 async def get_seller_rating(seller_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT AVG(rating), COUNT(*) FROM reviews WHERE seller_id=?", (seller_id,)
-        ) as c:
-            row = await c.fetchone()
-            return (round(row[0], 1) if row[0] else 0), (row[1] if row[1] else 0)
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "SELECT AVG(rating) as avg, COUNT(*) as cnt FROM reviews WHERE seller_id=$1",
+            seller_id
+        )
+        avg = round(float(row["avg"]), 1) if row and row["avg"] else 0
+        cnt = row["cnt"] if row else 0
+        return avg, cnt
 
-# ─── WITHDRAWALS ─────────────────────────────────────────
 
-async def create_withdrawal(user_id: int, amount: float):
-    async with aiosqlite.connect(DB_PATH) as db:
-        c = await db.execute("INSERT INTO withdrawals (user_id, amount) VALUES (?,?)", (user_id, amount))
-        await db.commit()
-        return c.lastrowid
+# ─── WITHDRAWALS ─────────────────────────────────────────────────────────────
+
+async def create_withdrawal(user_id: int, amount: float) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "INSERT INTO withdrawals (user_id, amount) VALUES ($1, $2) RETURNING id",
+            user_id, amount
+        )
+        return row["id"]
+
 
 async def get_pending_withdrawals():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT w.*, u.username, u.nickname FROM withdrawals w "
-            "JOIN users u ON w.user_id=u.user_id WHERE w.status='pending'"
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
+            """SELECT w.*, u.username, u.nickname FROM withdrawals w
+               JOIN users u ON w.user_id=u.user_id WHERE w.status='pending'"""
+        )
+
 
 async def complete_withdrawal(w_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE withdrawals SET status='done' WHERE id=?", (w_id,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute("UPDATE withdrawals SET status='done' WHERE id=$1", w_id)
 
-# ─── DM TOKENS (анонимные ссылки) ────────────────────────
 
-import secrets
+# ─── DM TOKENS ───────────────────────────────────────────────────────────────
 
 async def get_or_create_dm_token(user_id: int) -> str:
-    """Возвращает существующий токен или создаёт новый."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT token FROM dm_tokens WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow("SELECT token FROM dm_tokens WHERE user_id=$1", user_id)
         if row:
             return row["token"]
         token = secrets.token_urlsafe(12)
-        await db.execute("INSERT INTO dm_tokens (token, user_id) VALUES (?,?)", (token, user_id))
-        await db.commit()
+        await db.execute(
+            "INSERT INTO dm_tokens (token, user_id) VALUES ($1, $2)", token, user_id
+        )
         return token
 
+
 async def get_user_by_dm_token(token: str):
-    """Возвращает user_id по токену или None."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT user_id FROM dm_tokens WHERE token=?", (token,)) as c:
-            row = await c.fetchone()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow("SELECT user_id FROM dm_tokens WHERE token=$1", token)
         return row["user_id"] if row else None
 
-# ─── TOPUPS ──────────────────────────────────────────────
+
+# ─── TOPUPS ──────────────────────────────────────────────────────────────────
 
 async def create_topup(user_id: int, amount: float, da_comment: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        c = await db.execute(
-            "INSERT INTO topups (user_id, amount, da_comment) VALUES (?,?,?)",
-            (user_id, amount, da_comment)
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "INSERT INTO topups (user_id, amount, da_comment) VALUES ($1, $2, $3) RETURNING id",
+            user_id, amount, da_comment
         )
-        await db.commit()
-        return c.lastrowid
+        return row["id"]
+
 
 async def get_pending_topups() -> list:
-    """Все топапы в статусе pending — для фонового polling."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        return await db.fetch(
             "SELECT * FROM topups WHERE status='pending' ORDER BY created_at ASC"
-        ) as c:
-            return await c.fetchall()
+        )
+
 
 async def complete_topup(topup_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE topups SET status='done' WHERE id=?", (topup_id,))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute("UPDATE topups SET status='done' WHERE id=$1", topup_id)
+
 
 async def cancel_topup(topup_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE topups SET status='cancelled' WHERE id=?", (topup_id,))
-        await db.commit()
-
-async def get_pending_orders_for_payment() -> list:
-    """Все заказы в статусе pending_payment — для фонового polling."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM orders WHERE status='pending_payment' ORDER BY created_at ASC"
-        ) as c:
-            return await c.fetchall()
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        await db.execute("UPDATE topups SET status='cancelled' WHERE id=$1", topup_id)
 
 
-# ─── USED DONATION IDS ───────────────────────────────────
+# ─── USED DONATION IDS ───────────────────────────────────────────────────────
 
 async def get_used_donation_ids() -> set:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT donation_id FROM used_donation_ids") as c:
-            rows = await c.fetchall()
-            return {r[0] for r in rows}
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        rows = await db.fetch("SELECT donation_id FROM used_donation_ids")
+        return {r["donation_id"] for r in rows}
+
 
 async def mark_donation_used(donation_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    pool = await get_pool()
+    async with pool.acquire() as db:
         await db.execute(
-            "INSERT OR IGNORE INTO used_donation_ids (donation_id) VALUES (?)",
-            (donation_id,)
+            "INSERT INTO used_donation_ids (donation_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            donation_id
         )
-        await db.commit()
+
 
 async def is_donation_used(donation_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT 1 FROM used_donation_ids WHERE donation_id=?", (donation_id,)
-        ) as c:
-            return (await c.fetchone()) is not None
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "SELECT 1 FROM used_donation_ids WHERE donation_id=$1", donation_id
+        )
+        return row is not None
 
-# ─── SUPPORT ─────────────────────────────────────────────
+
+# ─── SUPPORT ─────────────────────────────────────────────────────────────────
 
 async def create_support_ticket(user_id: int, message: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        c = await db.execute(
-            "INSERT INTO support_tickets (user_id, message) VALUES (?,?)",
-            (user_id, message)
+    pool = await get_pool()
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "INSERT INTO support_tickets (user_id, message) VALUES ($1, $2) RETURNING id",
+            user_id, message
         )
-        await db.commit()
-        return c.lastrowid
+        return row["id"]
