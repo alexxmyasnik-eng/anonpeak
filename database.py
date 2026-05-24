@@ -199,15 +199,6 @@ async def init_db():
 
         await db.commit()
 
-        # Чистим старые donation IDs при старте (старше 30 дней)
-        try:
-            await db.execute(
-                "DELETE FROM used_donation_ids WHERE used_at < datetime('now', '-30 days')"
-            )
-            await db.commit()
-        except Exception:
-            pass
-
 
 # ─── USERS ───────────────────────────────────────────────
 
@@ -265,35 +256,6 @@ async def change_balance(user_id: int, delta: float) -> bool:
         )
         await db.commit()
         return True
-
-
-async def change_earn_balance(user_id: int, delta: float) -> bool:
-    """
-    Изменяет earn_balance (заработанные средства, доступные для вывода).
-    Используется при разморозке средств продавца после завершения заказа.
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        if delta < 0:
-            async with db.execute(
-                "SELECT earn_balance FROM users WHERE user_id=?", (user_id,)
-            ) as c:
-                row = await c.fetchone()
-            current = float(row[0]) if row and row[0] is not None else 0.0
-            if current + delta < 0:
-                return False
-        await db.execute(
-            "UPDATE users SET earn_balance = earn_balance + ? WHERE user_id=?",
-            (delta, user_id)
-        )
-        await db.commit()
-        return True
-
-
-async def get_earn_balance(user_id: int) -> float:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT earn_balance FROM users WHERE user_id=?", (user_id,)) as c:
-            row = await c.fetchone()
-            return float(row[0]) if row and row[0] is not None else 0.0
 
 async def update_last_chat(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -597,33 +559,6 @@ async def is_donation_used(donation_id: int) -> bool:
             "SELECT 1 FROM used_donation_ids WHERE donation_id=?", (donation_id,)
         ) as c:
             return (await c.fetchone()) is not None
-
-async def try_claim_donation(donation_id: int) -> bool:
-    """
-    Атомарно помечает донат как использованный.
-    Возвращает True если успешно (первый кто занял),
-    False если донат уже был использован.
-    Решает race condition между is_donation_used + mark_donation_used.
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        c = await db.execute(
-            "INSERT OR IGNORE INTO used_donation_ids (donation_id) VALUES (?)",
-            (donation_id,)
-        )
-        await db.commit()
-        return c.rowcount > 0  # rowcount=1 — успешно занято, 0 — уже существовало
-
-async def cleanup_old_donations(days: int = 30):
-    """
-    Удаляет записи об использованных донатах старше N дней.
-    Вызывать периодически чтобы таблица не росла бесконечно.
-    """
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM used_donation_ids WHERE used_at < datetime('now', ? || ' days')",
-            (f"-{days}",)
-        )
-        await db.commit()
 
 
 # ─── SUPPORT ─────────────────────────────────────────────
