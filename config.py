@@ -15,4 +15,6 @@ MIN_PRICE    = 15
 MIN_WITHDRAW = 100
 CHAT_COOLDOWN = 30 * 60   # 30 минут в секундах
 
-DB_PATH = "bot.db"
+DB_PATH = "bot.db"  # оставь пока для database.py если он ещё на sqlite
+DATABASE_URL = os.getenv("DATABASE_URL")  # Neon — уже есть в Render
+MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID", "0"))  # приватный канал для фото/видео
