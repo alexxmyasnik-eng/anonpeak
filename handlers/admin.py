@@ -108,12 +108,13 @@ async def admin_panel(message: Message):
 @router.message(Command("stats"))
 async def stats(message: Message):
     if not is_admin(message.from_user.id): return
-    async with __import__("aiosqlite").connect(DB_PATH) as d:
-        users    = (await (await d.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-        products = (await (await d.execute("SELECT COUNT(*) FROM products WHERE status='active'")).fetchone())[0]
-        orders   = (await (await d.execute("SELECT COUNT(*) FROM orders WHERE status='done'")).fetchone())[0]
-        earned   = (await (await d.execute("SELECT SUM(commission) FROM orders WHERE status='done'")).fetchone())[0] or 0
-        topups   = (await (await d.execute("SELECT SUM(amount) FROM topups WHERE status='done'")).fetchone())[0] or 0
+    from db_neon import get_conn
+    async with get_conn() as d:
+        users    = await d.fetchval("SELECT COUNT(*) FROM users")
+        products = await d.fetchval("SELECT COUNT(*) FROM products WHERE status='active'")
+        orders   = await d.fetchval("SELECT COUNT(*) FROM orders WHERE status='done'")
+        earned   = await d.fetchval("SELECT COALESCE(SUM(commission),0) FROM orders WHERE status='done'")
+        topups   = await d.fetchval("SELECT COALESCE(SUM(amount),0) FROM topups WHERE status='done'")
     await message.answer(
         f"📊 <b>Статистика</b>\n\n"
         f"👥 Пользователей: {users}\n"
