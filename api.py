@@ -5,6 +5,7 @@ try:
     HAS_AIOHTTP = True
 except ImportError:
     HAS_AIOHTTP = False
+from db_neon import get_conn, _get_pool    
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -43,7 +44,8 @@ CATEGORIES = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield  # соединения создаются по требованию, пул не нужен
+    await _get_pool()
+    yield
 
 
 app = FastAPI(lifespan=lifespan)
