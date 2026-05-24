@@ -493,7 +493,7 @@ async def withdraw(uid: int = Query(...), amount: float = Query(...), username: 
 # ── TRANSACTIONS ──────────────────────────────────────────
 @app.get("/transactions")
 async def get_transactions(uid: int = Query(...)):
-    now = datetime.now(MSK).isoformat()
+    now = datetime.now(MSK)
     async with get_conn() as d:
         due = await d.fetch(
             "SELECT * FROM frozen_funds WHERE user_id=$1 AND is_released=0 AND unfreeze_at<=$2",
