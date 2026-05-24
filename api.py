@@ -128,6 +128,8 @@ async def health(): return {"ok": True}
 
 
 # ── TG FILE RESOLVER ─────────────────────────────────────
+from fastapi.responses import RedirectResponse
+
 @app.get("/tg_file")
 async def tg_file(file_id: str = Query(...)):
     async with aiohttp.ClientSession() as s:
@@ -139,7 +141,7 @@ async def tg_file(file_id: str = Query(...)):
     if not data.get("ok"):
         raise HTTPException(404, "Файл не найден")
     path = data["result"]["file_path"]
-    return {"url": f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"}
+    return RedirectResponse(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}")
 
 
 # ── CATEGORIES ───────────────────────────────────────────
