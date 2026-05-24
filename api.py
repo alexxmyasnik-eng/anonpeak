@@ -47,8 +47,6 @@ CATEGORIES = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Пул создаётся при первом запросе, здесь просто прогреваем
-    await get_pool()
     yield
 
 
