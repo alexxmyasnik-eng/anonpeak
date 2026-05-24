@@ -265,20 +265,31 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
             params.append(seller)
         q += " ORDER BY COALESCE(is_premium,0) DESC, created_at DESC"
         rows = await d.fetch(q, *params)
+        if not rows:
+            return []
+        # Один запрос для всех продавцов
+        seller_ids = list({p["seller_id"] for p in rows})
+        users = await d.fetch("SELECT user_id,nickname FROM users WHERE user_id=ANY($1)", seller_ids)
+        user_map = {u["user_id"]: u["nickname"] or "Аноним" for u in users}
+        # Один запрос для всех рейтингов
+        ratings = await d.fetch(
+            "SELECT seller_id, ROUND(AVG(rating)::numeric,1) as avg FROM reviews WHERE seller_id=ANY($1) GROUP BY seller_id",
+            seller_ids
+        )
+        rating_map = {r["seller_id"]: float(r["avg"]) for r in ratings}
     result = []
     for p in rows:
-        s = await db.get_user(p["seller_id"])
-        avg, _ = await db.get_seller_rating(p["seller_id"])
+        sid = p["seller_id"]
         result.append({
             "id": p["id"], "title": p["title"], "description": p["description"],
-            "price": p["price"], "category": p["category"],
+            "price": round(float(p["price"]), 2), "category": p["category"],
             "subcategory": p["subcategory"] or "",
             "media_id": p["media_id"], "media_type": p["media_type"],
             "preview_url": p["preview_url"] or "",
-            "seller_id": p["seller_id"], "seller_nick": nick_of(s),
-            "seller_rating": round(avg, 1),
+            "seller_id": sid, "seller_nick": user_map.get(sid, "Аноним"),
+            "seller_rating": rating_map.get(sid, 0.0),
             "is_premium": bool(p["is_premium"]),
-            "seller_gets": round(p["price"] * (1 - SELL_COMM), 2)
+            "seller_gets": round(float(p["price"]) * (1 - SELL_COMM), 2)
         })
     return result
 
@@ -375,29 +386,38 @@ async def get_user_profile(user_id: int):
 # ── ORDERS ────────────────────────────────────────────────
 @app.get("/orders")
 async def get_orders(uid: int = Query(...)):
-    orders = await db.get_orders_for_user(uid)
+    async with get_conn() as d:
+        orders = await d.fetch(
+            "SELECT * FROM orders WHERE buyer_id=$1 OR seller_id=$1 ORDER BY created_at DESC", uid
+        )
+        if not orders:
+            return []
+        partner_ids = list({o["seller_id"] if o["buyer_id"]==uid else o["buyer_id"] for o in orders})
+        product_ids = list({o["product_id"] for o in orders})
+        users = await d.fetch("SELECT user_id,nickname FROM users WHERE user_id=ANY($1)", partner_ids)
+        user_map = {u["user_id"]: u["nickname"] or "Аноним" for u in users}
+        products = await d.fetch("SELECT id,title FROM products WHERE id=ANY($1)", product_ids)
+        prod_map = {p["id"]: p["title"] for p in products}
+        unreads = await d.fetch(
+            "SELECT order_id, COUNT(*) as cnt FROM messages WHERE order_id=ANY($1) AND receiver_id=$2 AND is_read=0 GROUP BY order_id",
+            [o["id"] for o in orders], uid
+        )
+        unread_map = {r["order_id"]: r["cnt"] for r in unreads}
     result = []
     for o in orders:
-        pid = o["seller_id"] if o["buyer_id"] == uid else o["buyer_id"]
-        partner = await db.get_user(pid)
-        p = await db.get_product(o["product_id"])
-        async with get_conn() as d:
-            row = await d.fetchrow(
-                "SELECT COUNT(*) as cnt FROM messages WHERE order_id=$1 AND receiver_id=$2 AND is_read=0",
-                o["id"], uid
-            )
-        unread = row["cnt"] if row else 0
+        pid = o["seller_id"] if o["buyer_id"]==uid else o["buyer_id"]
         result.append({
             "id": o["id"], "short_id": o["short_id"] or f"#{o['id']}",
-            "product_title": p["title"] if p else "Удалён", "amount": o["amount"],
-            "status": o["status"], "buyer_id": o["buyer_id"], "seller_id": o["seller_id"],
-            "partner_nick": nick_of(partner),
-            "role": "buyer" if o["buyer_id"] == uid else "seller",
-            "commission": o["commission"], "unread": unread,
+            "product_title": prod_map.get(o["product_id"], "Удалён"),
+            "amount": o["amount"], "status": o["status"],
+            "buyer_id": o["buyer_id"], "seller_id": o["seller_id"],
+            "partner_nick": user_map.get(pid, "Аноним"),
+            "role": "buyer" if o["buyer_id"]==uid else "seller",
+            "commission": o["commission"],
+            "unread": unread_map.get(o["id"], 0),
             "product_id": o["product_id"]
         })
     return result
-
 
 @app.get("/orders/{order_id}/messages")
 async def get_messages(order_id: int, uid: int = Query(...)):
@@ -666,11 +686,12 @@ async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
 async def friends_list(uid: int = Query(...)):
     async with get_conn() as d:
         rows = await d.fetch("SELECT friend_id,status FROM friends WHERE user_id=$1", uid)
-    result = []
-    for r in rows:
-        u = await db.get_user(r["friend_id"])
-        result.append({"friend_id": r["friend_id"], "nickname": nick_of(u), "status": r["status"]})
-    return result
+        if not rows:
+            return []
+        friend_ids = [r["friend_id"] for r in rows]
+        users = await d.fetch("SELECT user_id,nickname FROM users WHERE user_id=ANY($1)", friend_ids)
+        user_map = {u["user_id"]: u["nickname"] or "Аноним" for u in users}
+    return [{"friend_id": r["friend_id"], "nickname": user_map.get(r["friend_id"], "Аноним"), "status": r["status"]} for r in rows]
 
 
 @app.get("/friends/requests")
