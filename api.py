@@ -43,8 +43,8 @@ CATEGORIES = {
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    await _get_pool()
+async def lifespan(app):
+    asyncio.create_task(keepalive_loop())
     yield
 
 
@@ -314,21 +314,16 @@ async def get_product(product_id: int):
 # ── ME ────────────────────────────────────────────────────
 @app.get("/me")
 async def get_me(uid: int = Query(...)):
-    if not await db.get_user(uid): await db.create_user(uid, "")
-    u = await db.get_user(uid)
-    async with get_conn() as d:
-        row = await d.fetchrow(
-            "SELECT gender, earn_balance, avatar_url FROM users WHERE user_id=$1", uid
-        )
-    gender = row["gender"] or "" if row else ""
-    earn_bal = float(row["earn_balance"]) if row and row["earn_balance"] else 0.0
-    avatar_url = row["avatar_url"] or "" if row else ""
+    u = await db.get_or_create_user(uid)
     return {
-        "uid": uid, "nickname": u["nickname"] if u else "",
-        "age": u["age"] if u else None,
-        "balance": float(u["balance"]) if u else 0.0,
-        "earn_balance": earn_bal, "avatar_url": avatar_url,
-        "avatar_id": u["avatar_id"] if u else None, "gender": gender
+        "uid": uid,
+        "nickname": u["nickname"] or "",
+        "age": u["age"],
+        "balance": float(u["balance"] or 0),
+        "earn_balance": float(u["earn_balance"] or 0),
+        "avatar_url": u["avatar_url"] or "",
+        "avatar_id": u["avatar_id"],
+        "gender": u["gender"] or ""
     }
 
 
@@ -369,17 +364,26 @@ async def set_avatar(uid: int = Query(...), avatar_url: str = Query(default=""))
 
 @app.get("/user/{user_id}")
 async def get_user_profile(user_id: int):
-    u = await db.get_user(user_id)
-    if not u: raise HTTPException(404, "Не найден")
-    avg, cnt = await db.get_seller_rating(user_id)
     async with get_conn() as d:
-        row = await d.fetchrow("SELECT gender, avatar_url FROM users WHERE user_id=$1", user_id)
-    gender = row["gender"] or "" if row else ""
-    avatar_url = row["avatar_url"] or "" if row else ""
+        row = await d.fetchrow("""
+            SELECT u.*, 
+                   ROUND(AVG(r.rating)::numeric, 1) as avg_rating,
+                   COUNT(r.id) as review_cnt
+            FROM users u
+            LEFT JOIN reviews r ON r.seller_id = u.user_id
+            WHERE u.user_id = $1
+            GROUP BY u.user_id
+        """, user_id)
+    if not row:
+        raise HTTPException(404, "Не найден")
     return {
-        "uid": user_id, "nickname": u["nickname"] or "Аноним",
-        "age": u["age"], "gender": gender, "avatar_url": avatar_url,
-        "rating": round(avg, 1), "reviews": cnt,
+        "uid": user_id,
+        "nickname": row["nickname"] or "Аноним",
+        "age": row["age"],
+        "gender": row["gender"] or "",
+        "avatar_url": row["avatar_url"] or "",
+        "rating": float(row["avg_rating"] or 0),
+        "reviews": row["review_cnt"] or 0,
     }
 
 
