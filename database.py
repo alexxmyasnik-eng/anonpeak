@@ -6,6 +6,9 @@ from db_neon import get_conn
 
 
 async def init_db():
+    async with get_conn() as d:
+        await d.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS da_comment TEXT DEFAULT ''")
+        await d.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS da_comment TEXT DEFAULT ''")
     pass
 
 
