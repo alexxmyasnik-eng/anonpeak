@@ -20,8 +20,18 @@ async def create_user(user_id: int, username: str):
     async with get_conn() as d:
         await d.execute(
             "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            user_id, 
+            username
+        )
+
+
+async def get_or_create_user(user_id: int, username: str = ""):
+    async with get_conn() as d:
+        await d.execute(
+            "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             user_id, username
         )
+        return await d.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
 
 
 async def set_adult(user_id: int):
@@ -47,7 +57,8 @@ async def change_balance(user_id: int, delta: float):
     async with get_conn() as d:
         await d.execute(
             "UPDATE users SET balance = balance + $1 WHERE user_id=$2",
-            delta, user_id
+            delta, 
+            user_id
         )
 
 
