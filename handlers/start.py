@@ -45,36 +45,36 @@ async def cmd_start(message: Message, bot: Bot):
         await db.create_user(uid, message.from_user.username or "")
 
     # Обработка анонимной ссылки на ЛС: /start dm_TOKEN
-    args = message.text.split(maxsplit=1)
-    if len(args) > 1 and args[1].startswith("dm_"):
-        token = args[1][3:]
-        target_id = await db.get_user_by_dm_token(token)
-        if target_id and target_id != uid:
+   # args = message.text.split(maxsplit=1)
+   # if len(args) > 1 and args[1].startswith("dm_"):
+      #  token = args[1][3:]
+       # target_id = await db.get_user_by_dm_token(token)
+      #  if target_id and target_id != uid:
             # Ищем активный заказ между ними
-            order = await db.get_active_order_between(uid, target_id)
-            if order:
-                from keyboards.inline import kb_order_chat
-                role = "buyer" if order["buyer_id"] == uid else "seller"
-                await message.answer(
-                    "✉️ Открываю переписку...",
-                    reply_markup=kb_order_chat(order["id"], role)
+         #   order = await db.get_active_order_between(uid, target_id)
+          #  if order:
+              #  from keyboards.inline import kb_order_chat
+              #  role = "buyer" if order["buyer_id"] == uid else "seller"
+              #  await message.answer(
+               #     "✉️ Открываю переписку...",
+                #    reply_markup=kb_order_chat(order["id"], role)
+           #     )
+          #  else:
+             #   await message.answer(
+                #    "❌ Написать в ЛС можно только через заказ на маркете.\n"
+              #      "Купи или продай товар этому пользователю — тогда откроется чат.",
+               #     reply_markup=kb_main_menu(bool(user["nickname"]) if user else False)
                 )
-            else:
-                await message.answer(
-                    "❌ Написать в ЛС можно только через заказ на маркете.\n"
-                    "Купи или продай товар этому пользователю — тогда откроется чат.",
-                    reply_markup=kb_main_menu(bool(user["nickname"]) if user else False)
-                )
-            return
-        await message.answer("❌ Ссылка недействительна.",
-                             reply_markup=kb_main_menu(bool(user["nickname"]) if user else False))
-        return
+            #return
+       # await message.answer("❌ Ссылка недействительна.",
+                    #         reply_markup=kb_main_menu(bool(user["nickname"]) if user else False))
+      #  return
 
-    if not await is_subscribed(bot, uid, CHANNEL_ID):
-        await message.answer(
-            f"📢 Для входа подпишись на канал:\n👉 {CHANNEL_ID}",
-            reply_markup=kb_check_sub()
-        )
+   # if not await is_subscribed(bot, uid, CHANNEL_ID):
+       # await message.answer(
+           # f"📢 Для входа подпишись на канал:\n👉 {CHANNEL_ID}",
+         #   reply_markup=kb_check_sub()
+     #   )
         return
 
     user = await db.get_user(uid)
