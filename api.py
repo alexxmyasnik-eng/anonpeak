@@ -5,16 +5,15 @@ try:
     HAS_AIOHTTP = True
 except ImportError:
     HAS_AIOHTTP = False
-from db_neon import get_conn, _get_pool    
+from db_neon import get_conn, _get_pool, keepalive_loop
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-
 import database as db
-from db_neon import get_conn
+
 
 MSK = timezone(timedelta(hours=3))
 
