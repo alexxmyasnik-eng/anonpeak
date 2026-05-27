@@ -417,7 +417,7 @@ async def update_me(
     age: int = Query(...), gender: str = Query(default="")
 ):
     if not nickname or len(nickname) > 30: raise HTTPException(400, "Никнейм от 1 до 30 символов")
-    if age < 18 or age > 120: raise HTTPException(400, "Минимальный возраст — 18 лет")
+    if age < 10 or age > 120: raise HTTPException(400, "Минимальный возраст — 10 лет")
     async with get_conn() as d:
         row = await d.fetchrow(
             "SELECT user_id FROM users WHERE nickname=$1 AND user_id!=$2", nickname, uid
