@@ -39,6 +39,27 @@ CATEGORIES = {
     "audio":     {"name": "🎧 Аудио",       "subs": ["Секстинг","Стоны","Унижение"]},
     "signa":     {"name": "🖊 Сигны",       "subs": ["Обычная","В белье","На голом теле","Видео-сигна"]},
 }
+# ── SIMPLE IN-MEMORY CACHE ────────────────────────────────
+import time as _time
+_cache: dict = {}
+
+def cache_get(key: str, ttl: int = 60):
+    """Вернёт данные если не устарели, иначе None."""
+    entry = _cache.get(key)
+    if entry and (_time.monotonic() - entry["ts"]) < ttl:
+        return entry["data"]
+    return None
+
+def cache_set(key: str, data):
+    _cache[key] = {"data": data, "ts": _time.monotonic()}
+
+def cache_del(key: str):
+    _cache.pop(key, None)
+
+def cache_del_prefix(prefix: str):
+    for k in list(_cache.keys()):
+        if k.startswith(prefix):
+            _cache.pop(k, None)
 
 
 @asynccontextmanager
@@ -183,6 +204,7 @@ async def create_product(
                 "UPDATE products SET is_premium=1, premium_at=$1 WHERE id=$2",
                 datetime.now(MSK).isoformat(), product_id
             )
+            cache_del_prefix("products:")
     return {"ok": True, "product_id": product_id, "seller_gets": round(price * (1 - SELL_COMM), 2)}
 
 
@@ -193,6 +215,7 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
         if not row: raise HTTPException(404, "Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
         await d.execute("UPDATE products SET status='deleted' WHERE id=$1", product_id)
+    cache_del_prefix("products:")
     return {"ok": True}
 
 
@@ -251,47 +274,109 @@ async def get_product_delivery_files(product_id: int):
 @app.get("/products/{category}")
 async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
     if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
+
+    # Кеш только для публичных листингов (без фильтра по продавцу)
+    cache_key = f"products:{category}:{sub.strip()}"
+    if not seller:
+        cached = cache_get(cache_key, ttl=60)
+        if cached is not None:
+            return cached
+
     async with get_conn() as d:
-        q = "SELECT * FROM products WHERE category=$1 AND status='active'"
+        q = """SELECT p.id, p.title, p.description, p.price, p.category,
+                      p.subcategory, p.media_id, p.media_type, p.preview_url,
+                      p.seller_id, p.is_premium,
+                      u.nickname as seller_nick
+               FROM products p
+               JOIN users u ON u.user_id = p.seller_id
+               WHERE p.category=$1 AND p.status='active'"""
         params = [category]
         idx = 2
         if sub and sub.strip():
-            q += f" AND TRIM(subcategory)=${idx}"
+            q += f" AND TRIM(p.subcategory)=${idx}"
             params.append(sub.strip())
             idx += 1
         if seller:
-            q += f" AND seller_id=${idx}"
+            q += f" AND p.seller_id=${idx}"
             params.append(seller)
-        q += " ORDER BY COALESCE(is_premium,0) DESC, created_at DESC"
+        q += " ORDER BY COALESCE(p.is_premium,0) DESC, p.created_at DESC LIMIT 100"
         rows = await d.fetch(q, *params)
         if not rows:
             return []
-        # Один запрос для всех продавцов
         seller_ids = list({p["seller_id"] for p in rows})
-        users = await d.fetch("SELECT user_id,nickname FROM users WHERE user_id=ANY($1)", seller_ids)
-        user_map = {u["user_id"]: u["nickname"] or "Аноним" for u in users}
-        # Один запрос для всех рейтингов
         ratings = await d.fetch(
             "SELECT seller_id, ROUND(AVG(rating)::numeric,1) as avg FROM reviews WHERE seller_id=ANY($1) GROUP BY seller_id",
             seller_ids
         )
         rating_map = {r["seller_id"]: float(r["avg"]) for r in ratings}
-    result = []
-    for p in rows:
-        sid = p["seller_id"]
-        result.append({
-            "id": p["id"], "title": p["title"], "description": p["description"],
-            "price": round(float(p["price"]), 2), "category": p["category"],
-            "subcategory": p["subcategory"] or "",
-            "media_id": p["media_id"], "media_type": p["media_type"],
-            "preview_url": p["preview_url"] or "",
-            "seller_id": sid, "seller_nick": user_map.get(sid, "Аноним"),
-            "seller_rating": rating_map.get(sid, 0.0),
-            "is_premium": bool(p["is_premium"]),
-            "seller_gets": round(float(p["price"]) * (1 - SELL_COMM), 2)
-        })
+
+    result = [{
+        "id":            p["id"],
+        "title":         p["title"],
+        "description":   p["description"],
+        "price":         round(float(p["price"]), 2),
+        "category":      p["category"],
+        "subcategory":   p["subcategory"] or "",
+        "media_id":      p["media_id"],
+        "media_type":    p["media_type"],
+        "preview_url":   p["preview_url"] or "",
+        "seller_id":     p["seller_id"],
+        "seller_nick":   p["seller_nick"] or "Аноним",
+        "seller_rating": rating_map.get(p["seller_id"], 0.0),
+        "is_premium":    bool(p["is_premium"]),
+        "seller_gets":   round(float(p["price"]) * (1 - SELL_COMM), 2)
+    } for p in rows]
+
+    if not seller:
+        cache_set(cache_key, result)
     return result
 
+@app.get("/search")
+async def search_products(q: str = Query(..., min_length=2)):
+    cache_key = f"search:{q.lower().strip()}"
+    cached = cache_get(cache_key, ttl=120)
+    if cached is not None:
+        return cached
+
+    async with get_conn() as d:
+        rows = await d.fetch("""
+            SELECT p.id, p.title, p.description, p.price, p.category,
+                   p.subcategory, p.media_id, p.media_type, p.preview_url,
+                   p.seller_id, p.is_premium,
+                   u.nickname as seller_nick,
+                   ROUND(AVG(r.rating)::numeric,1) as seller_rating
+            FROM products p
+            JOIN users u ON u.user_id = p.seller_id
+            LEFT JOIN reviews r ON r.seller_id = p.seller_id
+            WHERE p.status='active'
+              AND (
+                p.title ILIKE $1
+                OR p.description ILIKE $1
+              )
+            GROUP BY p.id, u.nickname
+            ORDER BY COALESCE(p.is_premium,0) DESC, p.created_at DESC
+            LIMIT 50
+        """, f"%{q.strip()}%")
+
+    result = [{
+        "id":            p["id"],
+        "title":         p["title"],
+        "description":   p["description"],
+        "price":         round(float(p["price"]), 2),
+        "category":      p["category"],
+        "subcategory":   p["subcategory"] or "",
+        "media_id":      p["media_id"],
+        "media_type":    p["media_type"],
+        "preview_url":   p["preview_url"] or "",
+        "seller_id":     p["seller_id"],
+        "seller_nick":   p["seller_nick"] or "Аноним",
+        "seller_rating": float(p["seller_rating"]) if p["seller_rating"] else 0.0,
+        "is_premium":    bool(p["is_premium"]),
+        "seller_gets":   round(float(p["price"]) * (1 - SELL_COMM), 2)
+    } for p in rows]
+
+    cache_set(cache_key, result)
+    return result
 
 @app.get("/product/{product_id}")
 async def get_product(product_id: int):
@@ -348,18 +433,43 @@ async def update_me(
 @app.post("/me/set_avatar")
 async def set_avatar_post(request: Request, uid: int = Query(...)):
     body = await request.body()
-    avatar_data = body.decode('utf-8')[:15000000]
+    # Если прислали file_id (короткая строка) — сохраняем напрямую
+    text = body.decode('utf-8').strip()
+    if len(text) < 200:  # file_id всегда короткий
+        async with get_conn() as d:
+            await d.execute("UPDATE users SET avatar_url=$1 WHERE user_id=$2", text, uid)
+        return {"ok": True, "mode": "file_id"}
+    # Старый путь: base64 — конвертируем через бота
+    import base64, io
+    try:
+        header, b64data = text.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+    except Exception:
+        raise HTTPException(400, "Неверный формат")
+    # Отправляем фото в Telegram-канал через бота, получаем file_id
+    from config import MEDIA_CHANNEL_ID, BOT_TOKEN
+    import aiohttp as _aio
+    async with _aio.ClientSession() as session:
+        data = _aio.FormData()
+        data.add_field("chat_id", str(MEDIA_CHANNEL_ID))
+        data.add_field("photo", io.BytesIO(img_bytes), filename="ava.jpg", content_type="image/jpeg")
+        async with session.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", data=data) as resp:
+            result = await resp.json()
+    if not result.get("ok"):
+        raise HTTPException(500, "Ошибка загрузки фото")
+    # Берём наибольший размер фото
+    file_id = result["result"]["photo"][-1]["file_id"]
     async with get_conn() as d:
-        await d.execute("UPDATE users SET avatar_url=$1 WHERE user_id=$2", avatar_data, uid)
-    return {"ok": True}
+        await d.execute("UPDATE users SET avatar_url=$1 WHERE user_id=$2", file_id, uid)
+    return {"ok": True, "mode": "file_id", "file_id": file_id}
 
 
 @app.get("/me/set_avatar")
 async def set_avatar(uid: int = Query(...), avatar_url: str = Query(default="")):
+    # Оставляем для совместимости (URL или file_id)
     async with get_conn() as d:
         await d.execute("UPDATE users SET avatar_url=$1 WHERE user_id=$2", avatar_url, uid)
     return {"ok": True}
-
 
 @app.get("/user/{user_id}")
 async def get_user_profile(user_id: int):
@@ -390,37 +500,40 @@ async def get_user_profile(user_id: int):
 @app.get("/orders")
 async def get_orders(uid: int = Query(...)):
     async with get_conn() as d:
-        orders = await d.fetch(
-            "SELECT * FROM orders WHERE buyer_id=$1 OR seller_id=$1 ORDER BY created_at DESC", uid
-        )
-        if not orders:
-            return []
-        partner_ids = list({o["seller_id"] if o["buyer_id"]==uid else o["buyer_id"] for o in orders})
-        product_ids = list({o["product_id"] for o in orders})
-        users = await d.fetch("SELECT user_id,nickname FROM users WHERE user_id=ANY($1)", partner_ids)
-        user_map = {u["user_id"]: u["nickname"] or "Аноним" for u in users}
-        products = await d.fetch("SELECT id,title FROM products WHERE id=ANY($1)", product_ids)
-        prod_map = {p["id"]: p["title"] for p in products}
-        unreads = await d.fetch(
-            "SELECT order_id, COUNT(*) as cnt FROM messages WHERE order_id=ANY($1) AND receiver_id=$2 AND is_read=0 GROUP BY order_id",
-            [o["id"] for o in orders], uid
-        )
-        unread_map = {r["order_id"]: r["cnt"] for r in unreads}
-    result = []
-    for o in orders:
-        pid = o["seller_id"] if o["buyer_id"]==uid else o["buyer_id"]
-        result.append({
-            "id": o["id"], "short_id": o["short_id"] or f"#{o['id']}",
-            "product_title": prod_map.get(o["product_id"], "Удалён"),
-            "amount": o["amount"], "status": o["status"],
-            "buyer_id": o["buyer_id"], "seller_id": o["seller_id"],
-            "partner_nick": user_map.get(pid, "Аноним"),
-            "role": "buyer" if o["buyer_id"]==uid else "seller",
-            "commission": o["commission"],
-            "unread": unread_map.get(o["id"], 0),
-            "product_id": o["product_id"]
-        })
-    return result
+        orders = await d.fetch("""
+            SELECT o.id, o.short_id, o.product_id, o.buyer_id, o.seller_id,
+                   o.amount, o.status, o.commission, o.created_at,
+                   p.title as product_title,
+                   u.nickname as partner_nick,
+                   COALESCE(unr.cnt, 0) as unread
+            FROM orders o
+            LEFT JOIN products p ON p.id = o.product_id
+            LEFT JOIN users u ON u.user_id =
+                CASE WHEN o.buyer_id=$1 THEN o.seller_id ELSE o.buyer_id END
+            LEFT JOIN (
+                SELECT order_id, COUNT(*) as cnt
+                FROM messages
+                WHERE receiver_id=$1 AND is_read=0
+                GROUP BY order_id
+            ) unr ON unr.order_id = o.id
+            WHERE o.buyer_id=$1 OR o.seller_id=$1
+            ORDER BY o.created_at DESC
+            LIMIT 50
+        """, uid)
+    return [{
+        "id":            o["id"],
+        "short_id":      o["short_id"] or f"#{o['id']}",
+        "product_title": o["product_title"] or "Удалён",
+        "amount":        o["amount"],
+        "status":        o["status"],
+        "buyer_id":      o["buyer_id"],
+        "seller_id":     o["seller_id"],
+        "partner_nick":  o["partner_nick"] or "Аноним",
+        "role":          "buyer" if o["buyer_id"] == uid else "seller",
+        "commission":    o["commission"],
+        "unread":        o["unread"],
+        "product_id":    o["product_id"]
+    } for o in orders]
 
 @app.get("/orders/{order_id}/messages")
 async def get_messages(order_id: int, uid: int = Query(...)):
@@ -688,26 +801,30 @@ async def remove_friend(uid: int = Query(...), friend_id: int = Query(...)):
 @app.get("/friends/list")
 async def friends_list(uid: int = Query(...)):
     async with get_conn() as d:
-        rows = await d.fetch("SELECT friend_id,status FROM friends WHERE user_id=$1", uid)
-        if not rows:
-            return []
-        friend_ids = [r["friend_id"] for r in rows]
-        users = await d.fetch("SELECT user_id,nickname FROM users WHERE user_id=ANY($1)", friend_ids)
-        user_map = {u["user_id"]: u["nickname"] or "Аноним" for u in users}
-    return [{"friend_id": r["friend_id"], "nickname": user_map.get(r["friend_id"], "Аноним"), "status": r["status"]} for r in rows]
+        rows = await d.fetch("""
+            SELECT f.friend_id, u.nickname, u.avatar_url, f.status
+            FROM friends f
+            JOIN users u ON u.user_id = f.friend_id
+            WHERE f.user_id=$1 AND f.status='accepted'
+        """, uid)
+    return [{
+        "friend_id":  r["friend_id"],
+        "nickname":   r["nickname"] or "Аноним",
+        "avatar_url": r["avatar_url"] or "",
+        "status":     r["status"]
+    } for r in rows]
 
 
 @app.get("/friends/requests")
 async def friend_requests(uid: int = Query(...)):
     async with get_conn() as d:
-        rows = await d.fetch(
-            "SELECT user_id FROM friends WHERE friend_id=$1 AND status='pending'", uid
-        )
-    result = []
-    for r in rows:
-        u = await db.get_user(r["user_id"])
-        result.append({"user_id": r["user_id"], "nickname": nick_of(u)})
-    return result
+        rows = await d.fetch("""
+            SELECT f.user_id, u.nickname, u.avatar_url
+            FROM friends f
+            JOIN users u ON u.user_id = f.user_id
+            WHERE f.friend_id=$1 AND f.status='pending'
+        """, uid)
+    return [{"user_id": r["user_id"], "nickname": r["nickname"] or "Аноним", "avatar_url": r["avatar_url"] or ""} for r in rows]
 
 
 @app.get("/friends/status")
@@ -811,43 +928,73 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
              "is_read": bool(r["is_read"]), "created_at": str(r["created_at"])} for r in rows]
 
 
-@app.get("/dm/unread_count")
-async def dm_unread(uid: int = Query(...)):
-    async with get_conn() as d:
-        rows = await d.fetch(
-            "SELECT from_id, COUNT(*) as cnt FROM dm_messages WHERE to_id=$1 AND is_read=0 GROUP BY from_id",
-            uid
-        )
-    return {str(r["from_id"]): r["cnt"] for r in rows}
 
+@app.get("/notifications")
+async def notifications(uid: int = Query(...)):
+    async with get_conn() as d:
+        # Непрочитанные сообщения в заказах
+        orders_row = await d.fetchrow("""
+            SELECT COUNT(*) as cnt
+            FROM messages m
+            JOIN orders o ON o.id = m.order_id
+            WHERE m.receiver_id=$1
+              AND m.is_read=0
+              AND (o.buyer_id=$1 OR o.seller_id=$1)
+        """, uid)
+
+        # Непрочитанные DM
+        dm_row = await d.fetchrow("""
+            SELECT COUNT(*) as cnt
+            FROM dm_messages
+            WHERE to_id=$1 AND is_read=0
+        """, uid)
+
+        # Заявки в друзья
+        fr_row = await d.fetchrow("""
+            SELECT COUNT(*) as cnt
+            FROM friends
+            WHERE friend_id=$1 AND status='pending'
+        """, uid)
+
+    return {
+        "orders_unread":   int(orders_row["cnt"]) if orders_row else 0,
+        "dm_unread":       int(dm_row["cnt"])     if dm_row     else 0,
+        "friend_requests": int(fr_row["cnt"])     if fr_row     else 0
+    }
 
 @app.get("/dm/conversations")
 async def dm_conversations(uid: int = Query(...)):
     async with get_conn() as d:
-        rows = await d.fetch(
-            """SELECT DISTINCT ON (partner_id)
-                CASE WHEN from_id=$1 THEN to_id ELSE from_id END as partner_id,
-                message, created_at, is_read, from_id
-               FROM dm_messages
-               WHERE from_id=$1 OR to_id=$1
-               ORDER BY partner_id, created_at DESC""",
-            uid
-        )
-    result = []
-    for r in rows:
-        partner = await db.get_user(r["partner_id"])
-        async with get_conn() as d:
-            urow = await d.fetchrow(
-                "SELECT COUNT(*) as cnt FROM dm_messages WHERE to_id=$1 AND from_id=$2 AND is_read=0",
-                uid, r["partner_id"]
-            )
-        result.append({
-            "partner_id": r["partner_id"], "nickname": nick_of(partner),
-            "last_message": r["message"], "created_at": str(r["created_at"]),
-            "unread": urow["cnt"] if urow else 0,
-            "is_out": r["from_id"] == uid
-        })
-    return result
+        rows = await d.fetch("""
+            SELECT DISTINCT ON (partner_id)
+                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END as partner_id,
+                m.message,
+                m.created_at,
+                m.is_read,
+                m.from_id,
+                u.nickname,
+                u.avatar_url,
+                (
+                    SELECT COUNT(*) FROM dm_messages x
+                    WHERE x.to_id=$1 AND x.from_id=
+                        CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
+                    AND x.is_read=0
+                ) as unread_cnt
+            FROM dm_messages m
+            JOIN users u ON u.user_id =
+                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
+            WHERE m.from_id=$1 OR m.to_id=$1
+            ORDER BY partner_id, m.created_at DESC
+        """, uid)
+    return [{
+        "partner_id": r["partner_id"],
+        "nickname":   r["nickname"] or "Аноним",
+        "avatar_url": r["avatar_url"] or "",
+        "last_message": r["message"],
+        "created_at": str(r["created_at"]),
+        "unread": r["unread_cnt"],
+        "is_out": r["from_id"] == uid
+    } for r in rows]
 
 
 @app.get("/dm/delete")
