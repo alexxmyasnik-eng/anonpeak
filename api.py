@@ -131,6 +131,7 @@ async def upload_media_to_tg(data_url: str) -> str:
 
 
 _chat_ratelimit: dict = defaultdict(list)
+_withdraw_ratelimit: dict = {}  # user_id -> timestamp последней заявки
 
 
 def check_rate_limit(user_id: int, max_msgs: int = 5, window_sec: int = 10) -> bool:
@@ -610,6 +611,11 @@ async def topup_create(amount: int = Query(...), uid: int = Query(...)):
 
 @app.get("/withdraw")
 async def withdraw(uid: int = Query(...), amount: float = Query(...), username: str = Query(...)):
+    now_ts = time.time()
+    last = _withdraw_ratelimit.get(uid, 0)
+    if now_ts - last < 3600:
+        wait_min = int((3600 - (now_ts - last)) // 60) + 1
+        raise HTTPException(429, f"Следующую заявку можно подать через {wait_min} мин.")
     if amount < MIN_WITHDRAW: raise HTTPException(400, f"Минимум {MIN_WITHDRAW} ₽")
     if not username or not username.startswith("@"): raise HTTPException(400, "Укажи @username")
     balance = await db.get_balance(uid)
@@ -618,6 +624,7 @@ async def withdraw(uid: int = Query(...), amount: float = Query(...), username: 
     stars = math.ceil(after / STAR_RATE)
     await db.change_balance(uid, -amount)
     w_id = await db.create_withdrawal(uid, amount)
+    _withdraw_ratelimit[uid] = now_ts
     async with get_conn() as d:
         await d.execute(
             "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
@@ -628,6 +635,29 @@ async def withdraw(uid: int = Query(...), amount: float = Query(...), username: 
         f"💸 <b>Вывод #{w_id}</b>\n👤 {nick_of(u)} (ID:{uid})\n"
         f"💰 {amount:.0f} ₽ → {after:.0f} ₽ → ⭐{stars}\n📱 {username}"))
     return {"ok": True, "w_id": w_id, "after_commission": after, "stars": stars}
+
+@app.get("/withdraw/cancel")
+async def withdraw_cancel(uid: int = Query(...), w_id: int = Query(...)):
+    # Проверяем что заявка принадлежит этому пользователю
+    async with get_conn() as d:
+        row = await d.fetchrow(
+            "SELECT user_id, status FROM withdrawals WHERE id=$1", w_id
+        )
+    if not row:
+        raise HTTPException(404, "Заявка не найдена")
+    if row["user_id"] != uid:
+        raise HTTPException(403, "Нет доступа")
+    if row["status"] != "pending":
+        raise HTTPException(400, "Нельзя отменить — заявка уже обработана")
+    result = await db.cancel_withdrawal(w_id)
+    if not result:
+        raise HTTPException(400, "Не удалось отменить заявку")
+    # Сбрасываем ratelimit чтобы можно было сразу подать новую
+    _withdraw_ratelimit.pop(uid, None)
+    u = await db.get_user(uid)
+    asyncio.create_task(notify(ADMIN_ID,
+        f"❌ <b>Вывод #{w_id} отменён</b> пользователем\n👤 {nick_of(u)} (ID:{uid})\n💰 {result['amount']:.0f} ₽ возвращено"))
+    return {"ok": True, "refunded": result["amount"]}
 
 
 # ── TRANSACTIONS ──────────────────────────────────────────
@@ -652,13 +682,24 @@ async def get_transactions(uid: int = Query(...)):
         txs = await d.fetch(
             "SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50", uid
         )
+        pending_wds = await d.fetch(
+            "SELECT id, amount, created_at FROM withdrawals WHERE user_id=$1 AND status='pending' ORDER BY created_at DESC",
+            uid
+        )
     frozen_list = [{"id": f["id"], "amount": f["amount"], "order_id": f["order_id"],
                     "unfreeze_at": str(f["unfreeze_at"]),
                     "description": "❄️ Заморожено до " + str(f["unfreeze_at"])[:10]}
                    for f in frozen]
     tx_list = [{"id": t["id"], "type": t["type"], "amount": t["amount"],
                 "description": t["description"], "created_at": str(t["created_at"])} for t in txs]
-    return {"transactions": tx_list, "frozen": frozen_list}
+    return {
+        "transactions": tx_list,
+        "frozen": frozen_list,
+        "pending_withdrawals": [
+            {"id": w["id"], "amount": float(w["amount"]), "created_at": str(w["created_at"])}
+            for w in pending_wds
+        ]
+    }
 
 
 # ── SUPPORT ───────────────────────────────────────────────
