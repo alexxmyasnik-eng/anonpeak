@@ -266,6 +266,27 @@ async def complete_withdrawal(w_id: int):
         await d.execute("UPDATE withdrawals SET status='done' WHERE id=$1", w_id)
 
 
+async def cancel_withdrawal(w_id: int) -> dict | None:
+    """Отменяет pending-вывод и возвращает средства на earn_balance пользователя.
+    Возвращает {'user_id':..., 'amount':...} или None если не найдено/уже обработано."""
+    async with get_conn() as d:
+        row = await d.fetchrow(
+            "SELECT user_id, amount FROM withdrawals WHERE id=$1 AND status='pending'", w_id
+        )
+        if not row:
+            return None
+        await d.execute("UPDATE withdrawals SET status='cancelled' WHERE id=$1", w_id)
+        await d.execute(
+            "UPDATE users SET balance = balance + $1 WHERE user_id=$2",
+            float(row["amount"]), row["user_id"]
+        )
+        await d.execute(
+            "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
+            row["user_id"], "topup", float(row["amount"]), f"Отмена вывода #{w_id}"
+        )
+        return {"user_id": row["user_id"], "amount": float(row["amount"])}
+
+
 # ─── DM TOKENS ───────────────────────────────────────────────────────────────
 
 async def get_or_create_dm_token(user_id: int) -> str:
@@ -306,7 +327,13 @@ async def get_pending_topups() -> list:
 
 async def complete_topup(topup_id: int):
     async with get_conn() as d:
+        row = await d.fetchrow("SELECT user_id, amount FROM topups WHERE id=$1", topup_id)
         await d.execute("UPDATE topups SET status='done' WHERE id=$1", topup_id)
+        if row:
+            await d.execute(
+                "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
+                row["user_id"], "topup", float(row["amount"]), f"Пополнение баланса"
+            )
 
 
 async def cancel_topup(topup_id: int):
