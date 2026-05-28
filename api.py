@@ -628,7 +628,7 @@ async def withdraw(uid: int = Query(...), amount: float = Query(...), username: 
     async with get_conn() as d:
         await d.execute(
             "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
-            uid, "withdraw", -amount, f"Вывод ⭐{stars} · комиссия {round(amount * WITHDRAW_COMM, 2)} ₽"
+            uid, "withdraw", -amount, f"Вывод {stars} ⭐"
         )
     u = await db.get_user(uid)
     asyncio.create_task(notify(ADMIN_ID,
@@ -652,12 +652,60 @@ async def withdraw_cancel(uid: int = Query(...), w_id: int = Query(...)):
     result = await db.cancel_withdrawal(w_id)
     if not result:
         raise HTTPException(400, "Не удалось отменить заявку")
-    # Сбрасываем ratelimit чтобы можно было сразу подать новую
-    _withdraw_ratelimit.pop(uid, None)
     u = await db.get_user(uid)
     asyncio.create_task(notify(ADMIN_ID,
         f"❌ <b>Вывод #{w_id} отменён</b> пользователем\n👤 {nick_of(u)} (ID:{uid})\n💰 {result['amount']:.0f} ₽ возвращено"))
     return {"ok": True, "refunded": result["amount"]}
+
+@app.get("/withdraw/cooldown")
+async def withdraw_cooldown(uid: int = Query(...)):
+    now_ts = time.time()
+    last = _withdraw_ratelimit.get(uid, 0)
+    remaining = 3600 - (now_ts - last)
+    if remaining > 0:
+        wait_min = int(remaining // 60) + 1
+        return {"wait_min": wait_min}
+    return {"wait_min": 0}
+
+@app.get("/admin/withdrawals")
+async def admin_withdrawals(uid: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        rows = await d.fetch(
+            """SELECT w.id, w.user_id, w.amount, w.created_at,
+                      u.nickname
+               FROM withdrawals w
+               JOIN users u ON u.user_id = w.user_id
+               WHERE w.status='pending'
+               ORDER BY w.created_at ASC""")
+    return [{"id": r["id"], "user_id": r["user_id"], "amount": float(r["amount"]),
+             "nickname": r["nickname"] or "Аноним", "created_at": str(r["created_at"])}
+            for r in rows]
+
+@app.get("/admin/withdraw/approve")
+async def admin_withdraw_approve(uid: int = Query(...), w_id: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT user_id, amount FROM withdrawals WHERE id=$1 AND status='pending'", w_id)
+        if not row: raise HTTPException(404, "Заявка не найдена или уже обработана")
+        await d.execute("UPDATE withdrawals SET status='done' WHERE id=$1", w_id)
+    u = await db.get_user(row["user_id"])
+    asyncio.create_task(notify(row["user_id"], f"✅ Вывод #{w_id} одобрен! {float(row['amount']):.0f} ₽ отправлены."))
+    return {"ok": True}
+
+@app.get("/admin/withdraw/reject")
+async def admin_withdraw_reject(uid: int = Query(...), w_id: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT user_id, amount FROM withdrawals WHERE id=$1 AND status='pending'", w_id)
+        if not row: raise HTTPException(404, "Заявка не найдена или уже обработана")
+        await db.change_balance(row["user_id"], float(row["amount"]))
+        await d.execute("UPDATE withdrawals SET status='cancelled' WHERE id=$1", w_id)
+        await d.execute("DELETE FROM transactions WHERE user_id=$1 AND type='withdraw' AND ABS(amount)=$2 AND created_at > NOW() - INTERVAL '2 hours'",
+                        row["user_id"], float(row["amount"]))
+    u = await db.get_user(row["user_id"])
+    asyncio.create_task(notify(row["user_id"], f"❌ Вывод #{w_id} отклонён. {float(row['amount']):.0f} ₽ возвращены на баланс."))
+    return {"ok": True}
 
 
 # ── TRANSACTIONS ──────────────────────────────────────────
