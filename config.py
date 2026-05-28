@@ -25,7 +25,7 @@ WITHDRAW_COMM  = 0.05
 STAR_RATE      = 1.5
 PREMIUM_PRICE  = 99.0
 MIN_PRICE      = 15
-MIN_WITHDRAW   = 100
+MIN_WITHDRAW   = 250
 CHAT_COOLDOWN  = 30 * 60
 
 # Оставляем для обратной совместимости с bot.py если он ещё на SQLite
