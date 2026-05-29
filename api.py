@@ -681,7 +681,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if not order or order["buyer_id"] != uid: raise HTTPException(403, "Нет доступа")
     if order["status"] not in ("paid", "seller_confirmed"): raise HTTPException(400, "Нельзя закрыть")
     seller_gets = round(order["amount"] - order["commission"], 2)
-    unfreeze_at = (datetime.now(MSK) + timedelta(days=2)).isoformat()
+    unfreeze_at = datetime.now(MSK) + timedelta(days=2)
     async with get_conn() as d:
         await d.execute(
             "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES ($1,$2,$3,$4)",
