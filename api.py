@@ -471,8 +471,8 @@ async def relist_product(
     is_premium: bool = Query(default=False)
 ):
     async with get_conn() as d:
-        row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1 AND status='sold'", product_id)
-        if not row: raise HTTPException(404, "Товар не найден или не продан")
+        row = await d.fetchrow("SELECT seller_id, status FROM products WHERE id=$1 AND status IN ('sold','pending')", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
     if is_premium:
         balance = await db.get_balance(uid)
