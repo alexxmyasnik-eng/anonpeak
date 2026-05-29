@@ -199,7 +199,7 @@ async def create_product(
     product_id = await db.add_product(uid, category, title, description or "", price, None, None)
 
     async with get_conn() as d:
-        await d.execute("UPDATE products SET subcategory=$1 WHERE id=$2", subcategory.strip(), product_id)
+        await d.execute("UPDATE products SET subcategory=$1, status='pending' WHERE id=$2", subcategory.strip(), product_id)
         if is_premium:
             await d.execute(
                 "UPDATE products SET is_premium=1, premium_at=$1 WHERE id=$2",
@@ -219,6 +219,75 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
     cache_del_prefix("products:")
     return {"ok": True}
 
+@app.get("/products/update")
+async def update_product(
+    uid: int = Query(...), product_id: int = Query(...),
+    title: str = Query(...), description: str = Query(default=""),
+    price: float = Query(...)
+):
+    if not title or len(title) > 100: raise HTTPException(400, "Название от 1 до 100 символов")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+        await d.execute(
+            "UPDATE products SET title=$1, description=$2, price=$3 WHERE id=$4",
+            title, description, price, product_id
+        )
+    cache_del_prefix("products:")
+    return {"ok": True}
+
+@app.get("/admin/moderation")
+async def admin_moderation(uid: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        rows = await d.fetch("""
+            SELECT p.id, p.title, p.category, p.price, p.created_at,
+                   u.nickname as seller_nick, p.seller_id
+            FROM products p
+            JOIN users u ON u.user_id = p.seller_id
+            WHERE p.status='pending'
+            ORDER BY p.created_at ASC
+        """)
+    return [{"id": r["id"], "title": r["title"], "category": r["category"],
+             "price": float(r["price"]), "seller_nick": r["seller_nick"] or "Аноним",
+             "seller_id": r["seller_id"], "created_at": str(r["created_at"])} for r in rows]
+
+@app.get("/admin/moderation/approve")
+async def admin_moderation_approve(uid: int = Query(...), product_id: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1 AND status='pending'", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        await d.execute("UPDATE products SET status='active' WHERE id=$1", product_id)
+    cache_del_prefix("products:")
+    asyncio.create_task(notify(row["seller_id"], f"✅ Ваш товар #{product_id} прошёл модерацию и теперь виден всем!"))
+    return {"ok": True}
+
+@app.get("/admin/moderation/reject")
+async def admin_moderation_reject(uid: int = Query(...), product_id: int = Query(...), reason: str = Query(default="Не соответствует правилам")):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id, is_premium FROM products WHERE id=$1 AND status='pending'", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["is_premium"]:
+            await db.change_balance(row["seller_id"], PREMIUM_PRICE)
+        await d.execute("UPDATE products SET status='deleted' WHERE id=$1", product_id)
+    asyncio.create_task(notify(row["seller_id"], f"❌ Ваш товар #{product_id} отклонён модератором. Причина: {reason}"))
+    return {"ok": True}
+
+@app.get("/admin/topup")
+async def admin_topup(uid: int = Query(...), to_uid: int = Query(...), amount: float = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    if amount <= 0: raise HTTPException(400, "Сумма должна быть > 0")
+    await db.change_balance(to_uid, amount)
+    async with get_conn() as d:
+        await d.execute(
+            "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
+            to_uid, "topup", amount, "Пополнение от администратора"
+        )
+    asyncio.create_task(notify(to_uid, f"💰 Администратор пополнил ваш баланс на {amount:.0f} ₽"))
+    return {"ok": True}
 
 @app.post("/products/{product_id}/set_preview")
 async def set_product_preview(product_id: int, uid: int = Query(...), request: Request = None):
@@ -392,9 +461,28 @@ async def get_product(product_id: int):
         "preview_url": p["preview_url"] or "",
         "seller_id": p["seller_id"], "seller_nick": nick_of(s),
         "seller_rating": round(avg, 1), "seller_reviews": cnt,
-        "seller_gets": round(p["price"] * (1 - SELL_COMM), 2)
+        "seller_gets": round(p["price"] * (1 - SELL_COMM), 2),
+        "status": p["status"]
     }
 
+@app.get("/products/relist")
+async def relist_product(
+    uid: int = Query(...), product_id: int = Query(...),
+    is_premium: bool = Query(default=False)
+):
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1 AND status='sold'", product_id)
+        if not row: raise HTTPException(404, "Товар не найден или не продан")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+    if is_premium:
+        balance = await db.get_balance(uid)
+        if balance < PREMIUM_PRICE:
+            raise HTTPException(400, f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽)")
+        await db.change_balance(uid, -PREMIUM_PRICE)
+    async with get_conn() as d:
+        await d.execute("UPDATE products SET status='pending', is_premium=$1 WHERE id=$2", 1 if is_premium else 0, product_id)
+    cache_del_prefix("products:")
+    return {"ok": True}
 
 # ── ME ────────────────────────────────────────────────────
 @app.get("/me")
@@ -574,6 +662,10 @@ async def buy(product_id: int = Query(...), uid: int = Query(...)):
     await db.change_balance(uid, -p["price"])
     order_id = await db.create_order(uid, p["seller_id"], product_id, p["price"], commission, "")
     await db.update_order_status(order_id, "paid")
+    # Помечаем товар как проданный
+    async with get_conn() as d:
+        await d.execute("UPDATE products SET status='sold' WHERE id=$1", product_id)
+    cache_del_prefix("products:")
     order = await db.get_order(order_id)
     short = order["short_id"] or f"#{order_id}"
     seller_gets = round(p["price"] - commission, 2)
@@ -1039,63 +1131,4 @@ async def notifications(uid: int = Query(...)):
         """, uid)
 
         # Заявки в друзья
-        fr_row = await d.fetchrow("""
-            SELECT COUNT(*) as cnt
-            FROM friends
-            WHERE friend_id=$1 AND status='pending'
-        """, uid)
-
-    return {
-        "orders_unread":   int(orders_row["cnt"]) if orders_row else 0,
-        "dm_unread":       int(dm_row["cnt"])     if dm_row     else 0,
-        "friend_requests": int(fr_row["cnt"])     if fr_row     else 0
-    }
-
-@app.get("/dm/conversations")
-async def dm_conversations(uid: int = Query(...)):
-    async with get_conn() as d:
-        rows = await d.fetch("""
-            SELECT DISTINCT ON (partner_id)
-                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END as partner_id,
-                m.message,
-                m.created_at,
-                m.is_read,
-                m.from_id,
-                u.nickname,
-                u.avatar_url,
-                (
-                    SELECT COUNT(*) FROM dm_messages x
-                    WHERE x.to_id=$1 AND x.from_id=
-                        CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
-                    AND x.is_read=0
-                ) as unread_cnt
-            FROM dm_messages m
-            JOIN users u ON u.user_id =
-                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
-            WHERE m.from_id=$1 OR m.to_id=$1
-            ORDER BY partner_id, m.created_at DESC
-        """, uid)
-    return [{
-        "partner_id": r["partner_id"],
-        "nickname":   r["nickname"] or "Аноним",
-        "avatar_url": r["avatar_url"] or "",
-        "last_message": r["message"],
-        "created_at": str(r["created_at"]),
-        "unread": r["unread_cnt"],
-        "is_out": r["from_id"] == uid
-    } for r in rows]
-
-
-@app.get("/dm/delete")
-async def dm_delete(uid: int = Query(...), with_id: int = Query(...), both_sides: int = Query(default=0)):
-    async with get_conn() as d:
-        if both_sides:
-            await d.execute(
-                "DELETE FROM dm_messages WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)",
-                uid, with_id
-            )
-        else:
-            await d.execute(
-                "DELETE FROM dm_messages WHERE from_id=$1 AND to_id=$2", uid, with_id
-            )
-    return {"ok": True}
+        fr_row = await d.
