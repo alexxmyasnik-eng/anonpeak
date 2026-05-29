@@ -1131,4 +1131,63 @@ async def notifications(uid: int = Query(...)):
         """, uid)
 
         # Заявки в друзья
-        fr_row = await d.
+        fr_row = await d.fetchrow("""
+            SELECT COUNT(*) as cnt
+            FROM friends
+            WHERE friend_id=$1 AND status='pending'
+        """, uid)
+
+    return {
+        "orders_unread":   int(orders_row["cnt"]) if orders_row else 0,
+        "dm_unread":       int(dm_row["cnt"])     if dm_row     else 0,
+        "friend_requests": int(fr_row["cnt"])     if fr_row     else 0
+    }
+
+@app.get("/dm/conversations")
+async def dm_conversations(uid: int = Query(...)):
+    async with get_conn() as d:
+        rows = await d.fetch("""
+            SELECT DISTINCT ON (partner_id)
+                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END as partner_id,
+                m.message,
+                m.created_at,
+                m.is_read,
+                m.from_id,
+                u.nickname,
+                u.avatar_url,
+                (
+                    SELECT COUNT(*) FROM dm_messages x
+                    WHERE x.to_id=$1 AND x.from_id=
+                        CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
+                    AND x.is_read=0
+                ) as unread_cnt
+            FROM dm_messages m
+            JOIN users u ON u.user_id =
+                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
+            WHERE m.from_id=$1 OR m.to_id=$1
+            ORDER BY partner_id, m.created_at DESC
+        """, uid)
+    return [{
+        "partner_id": r["partner_id"],
+        "nickname":   r["nickname"] or "Аноним",
+        "avatar_url": r["avatar_url"] or "",
+        "last_message": r["message"],
+        "created_at": str(r["created_at"]),
+        "unread": r["unread_cnt"],
+        "is_out": r["from_id"] == uid
+    } for r in rows]
+
+
+@app.get("/dm/delete")
+async def dm_delete(uid: int = Query(...), with_id: int = Query(...), both_sides: int = Query(default=0)):
+    async with get_conn() as d:
+        if both_sides:
+            await d.execute(
+                "DELETE FROM dm_messages WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)",
+                uid, with_id
+            )
+        else:
+            await d.execute(
+                "DELETE FROM dm_messages WHERE from_id=$1 AND to_id=$2", uid, with_id
+            )
+    return {"ok": True}
