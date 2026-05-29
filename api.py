@@ -472,7 +472,7 @@ async def relist_product(
 ):
     async with get_conn() as d:
         row = await d.fetchrow("SELECT seller_id, status FROM products WHERE id=$1", product_id)
-        if not row: raise HTTPException(404, "Товар не найден")
+        if not row: raise HTTPException(404, f"Товар не найден. product_id={product_id}, uid={uid}")
         if row["status"] not in ("sold", "pending"):
             raise HTTPException(400, f"Нельзя переопубликовать товар со статусом: {row['status']}")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
