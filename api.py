@@ -689,7 +689,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
         )
     await db.update_order_status(order_id, "done")
     asyncio.create_task(notify(order["seller_id"],
-        f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
+        f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at.strftime('%Y-%m-%d')}"))
     return {"ok": True}
 
 
