@@ -915,12 +915,13 @@ async def support_tickets(uid: int = Query(...)):
 async def my_products(uid: int = Query(...)):
     async with get_conn() as d:
         rows = await d.fetch(
-            "SELECT * FROM products WHERE seller_id=$1 AND status='active' ORDER BY created_at DESC", uid
+            "SELECT * FROM products WHERE seller_id=$1 AND status IN ('active','sold','pending') ORDER BY created_at DESC", uid
         )
     return [{"id": p["id"], "title": p["title"], "price": p["price"],
          "category": p["category"], "subcategory": p["subcategory"] or "",
          "preview_url": p["preview_url"] or "",
-         "is_premium": bool(p["is_premium"])} for p in rows]
+         "is_premium": bool(p["is_premium"]),
+         "status": p["status"]} for p in rows]
 
 
 # ── FRIENDS ───────────────────────────────────────────────
