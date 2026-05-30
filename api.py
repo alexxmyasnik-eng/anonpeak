@@ -1,4 +1,6 @@
 import random, string, math, asyncio, json, hmac, hashlib, urllib.parse, time, base64
+from PIL import Image, ImageFilter
+import io
 from collections import defaultdict
 try:
     import aiohttp
@@ -297,6 +299,21 @@ async def set_product_preview(product_id: int, uid: int = Query(...), request: R
         row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1", product_id)
         if not row: raise HTTPException(404, "Товар не найден")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+    # Декодируем base64
+    header, b64data = data_url.split(",", 1)
+    img_bytes = base64.b64decode(b64data)
+    
+    # Открываем, ресайзим до 400px и накладываем сильный блюр
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img.thumbnail((400, 400))
+    img = img.filter(ImageFilter.GaussianBlur(radius=20))
+    
+    # Сохраняем обратно в base64
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=70)
+    blurred_b64 = base64.b64encode(buf.getvalue()).decode()
+    data_url = f"data:image/jpeg;base64,{blurred_b64}"
+    
     file_id = await upload_media_to_tg(data_url)
     async with get_conn() as d:
         await d.execute("UPDATE products SET preview_url=$1 WHERE id=$2", file_id, product_id)
