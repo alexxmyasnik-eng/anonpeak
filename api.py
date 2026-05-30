@@ -687,7 +687,7 @@ async def get_orders(uid: int = Query(...)):
         orders = await d.fetch("""
             SELECT o.id, o.short_id, o.product_id, o.buyer_id, o.seller_id,
                    o.amount, o.status, o.commission, o.created_at,
-                   p.title as product_title,
+                   p.title as product_title, p.delivery_files,
                    u.nickname as partner_nick,
                    COALESCE(unr.cnt, 0) as unread
             FROM orders o
@@ -704,7 +704,7 @@ async def get_orders(uid: int = Query(...)):
             ORDER BY o.created_at DESC
             LIMIT 50
         """, uid)
-    return [{
+    return [{"delivery_files": o["delivery_files"] or "[]",
         "id":            o["id"],
         "short_id":      o["short_id"] or f"#{o['id']}",
         "product_title": o["product_title"] or "Удалён",
