@@ -375,8 +375,8 @@ async def relist_product(
         params = [category]
         idx = 2
         if sub and sub.strip():
-            q += f" AND TRIM(p.subcategory)=${idx}"
-            params.append(sub.strip())
+            q += f" AND REPLACE(TRIM(p.subcategory), '\u00a0', ' ')=${idx}"
+            params.append(sub.strip().replace('\u00a0', ' '))
             idx += 1
         if seller:
             q += f" AND p.seller_id=${idx}"
