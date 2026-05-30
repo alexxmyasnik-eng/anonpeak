@@ -203,7 +203,7 @@ async def create_product(
         if is_premium:
             await d.execute(
                 "UPDATE products SET is_premium=1, premium_at=$1 WHERE id=$2",
-                datetime.now(MSK), product_id
+                datetime.now(MSK).replace(tzinfo=None), product_id
             )
             cache_del_prefix("products:")
     return {"ok": True, "product_id": product_id, "seller_gets": round(price * (1 - SELL_COMM), 2)}
@@ -498,7 +498,7 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
         params = [category]
         idx = 2
         if sub and sub.strip():
-            q += f" AND TRIM(p.subcategory)=${idx}"
+            q += f" AND LOWER(TRIM(p.subcategory))=LOWER(${idx})"
             params.append(sub.strip())
             idx += 1
         if seller:
