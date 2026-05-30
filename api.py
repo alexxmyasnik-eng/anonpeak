@@ -1215,11 +1215,12 @@ async def dm_messages(uid: int = Query(...), with_id: int = Query(...)):
         rows = await d.fetch(
             """SELECT * FROM dm_messages
                WHERE (from_id=$1 AND to_id=$2) OR (from_id=$2 AND to_id=$1)
+                  OR (from_id=0 AND to_id=$1)
                ORDER BY created_at ASC LIMIT 100""",
             uid, with_id
         )
-    return [{"id": r["id"], "from_id": r["from_id"], "message": r["message"],
-             "reply_to_text": r["reply_to_text"] or "",
+    return [{"id": r["id"], "from_id": r["from_id"], "to_id": r["to_id"], "message": r["message"],
+             "reply_to_text": r["reply_to_text"] or "", "order_id": r["order_id"],
              "is_read": bool(r["is_read"]), "created_at": str(r["created_at"])} for r in rows]
 
 
