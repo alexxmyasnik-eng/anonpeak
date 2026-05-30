@@ -13,7 +13,6 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 import database as db
-print("API VERSION: 777")
 
 
 MSK = timezone(timedelta(hours=3))
@@ -290,12 +289,6 @@ async def admin_topup(uid: int = Query(...), to_uid: int = Query(...), amount: f
     asyncio.create_task(notify(to_uid, f"💰 Администратор пополнил ваш баланс на {amount:.0f} ₽"))
     return {"ok": True}
 
-@app.get("/debug/product")
-async def debug_product(product_id: int = Query(...)):
-    async with get_conn() as d:
-        row = await d.fetchrow("SELECT id, seller_id, status, title FROM products WHERE id=$1", product_id)
-    if not row: return {"found": False}
-    return {"found": True, "id": row["id"], "seller_id": row["seller_id"], "status": row["status"], "title": row["title"]}
 
 @app.post("/products/{product_id}/set_preview")
 async def set_product_preview(product_id: int, uid: int = Query(...), request: Request = None):
@@ -356,7 +349,7 @@ async def relist_product(
 ):
     async with get_conn() as d:
         row = await d.fetchrow("SELECT seller_id, status FROM products WHERE id=$1", product_id)
-        if not row: raise HTTPException(404, f"Товар не найден. product_id={product_id}, uid={uid}")
+        if not row: raise HTTPException(404, "Товар не найден")
         if row["status"] not in ("sold", "pending"):
             raise HTTPException(400, f"Нельзя переопубликовать товар со статусом: {row['status']}")
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
