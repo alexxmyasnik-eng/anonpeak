@@ -481,12 +481,60 @@ async def get_product(product_id: int):
 async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
     if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
 
-    # Кеш только для публичных листингов (без фильтра по продавцу)
     cache_key = f"products:{category}:{sub.strip()}"
     if not seller:
         cached = cache_get(cache_key, ttl=60)
         if cached is not None:
             return cached
+
+    async with get_conn() as d:
+        q = """SELECT p.id, p.title, p.description, p.price, p.category,
+                      p.subcategory, p.media_id, p.media_type, p.preview_url,
+                      p.seller_id, p.is_premium,
+                      u.nickname as seller_nick
+               FROM products p
+               JOIN users u ON u.user_id = p.seller_id
+               WHERE p.category=$1 AND p.status='active'"""
+        params = [category]
+        idx = 2
+        if sub and sub.strip():
+            q += f" AND TRIM(p.subcategory)=${idx}"
+            params.append(sub.strip())
+            idx += 1
+        if seller:
+            q += f" AND p.seller_id=${idx}"
+            params.append(seller)
+        q += " ORDER BY COALESCE(p.is_premium,0) DESC, p.created_at DESC LIMIT 100"
+        rows = await d.fetch(q, *params)
+        if not rows:
+            return []
+        seller_ids = list({p["seller_id"] for p in rows})
+        ratings = await d.fetch(
+            "SELECT seller_id, ROUND(AVG(rating)::numeric,1) as avg FROM reviews WHERE seller_id=ANY($1) GROUP BY seller_id",
+            seller_ids
+        )
+        rating_map = {r["seller_id"]: float(r["avg"]) for r in ratings}
+
+    result = [{
+        "id":            p["id"],
+        "title":         p["title"],
+        "description":   p["description"],
+        "price":         round(float(p["price"]), 2),
+        "category":      p["category"],
+        "subcategory":   p["subcategory"] or "",
+        "media_id":      p["media_id"],
+        "media_type":    p["media_type"],
+        "preview_url":   p["preview_url"] or "",
+        "seller_id":     p["seller_id"],
+        "seller_nick":   p["seller_nick"] or "Аноним",
+        "seller_rating": rating_map.get(p["seller_id"], 0.0),
+        "is_premium":    bool(p["is_premium"]),
+        "seller_gets":   round(float(p["price"]) * (1 - SELL_COMM), 2)
+    } for p in rows]
+
+    if not seller:
+        cache_set(cache_key, result)
+    return result
 
 # ── ME ────────────────────────────────────────────────────
 @app.get("/me")
