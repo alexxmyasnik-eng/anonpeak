@@ -199,11 +199,11 @@ async def create_product(
     product_id = await db.add_product(uid, category, title, description or "", price, None, None)
 
     async with get_conn() as d:
-        await d.execute("UPDATE products SET subcategory=$1 WHERE id=$2", subcategory.strip(), product_id)
+        await d.execute("UPDATE products SET subcategory=$1, status='pending' WHERE id=$2", subcategory.strip(), product_id)
         if is_premium:
             await d.execute(
                 "UPDATE products SET is_premium=1, premium_at=$1 WHERE id=$2",
-                datetime.now(MSK).isoformat(), product_id
+                datetime.now(MSK).replace(tzinfo=None), product_id
             )
             cache_del_prefix("products:")
     return {"ok": True, "product_id": product_id, "seller_gets": round(price * (1 - SELL_COMM), 2)}
@@ -217,6 +217,76 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
         if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
         await d.execute("UPDATE products SET status='deleted' WHERE id=$1", product_id)
     cache_del_prefix("products:")
+    return {"ok": True}
+
+@app.get("/products/update")
+async def update_product(
+    uid: int = Query(...), product_id: int = Query(...),
+    title: str = Query(...), description: str = Query(default=""),
+    price: float = Query(...)
+):
+    if not title or len(title) > 100: raise HTTPException(400, "Название от 1 до 100 символов")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+        await d.execute(
+            "UPDATE products SET title=$1, description=$2, price=$3 WHERE id=$4",
+            title, description, price, product_id
+        )
+    cache_del_prefix("products:")
+    return {"ok": True}
+
+@app.get("/admin/moderation")
+async def admin_moderation(uid: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        rows = await d.fetch("""
+            SELECT p.id, p.title, p.category, p.price, p.created_at,
+                   u.nickname as seller_nick, p.seller_id
+            FROM products p
+            JOIN users u ON u.user_id = p.seller_id
+            WHERE p.status='pending'
+            ORDER BY p.created_at ASC
+        """)
+    return [{"id": r["id"], "title": r["title"], "category": r["category"],
+             "price": float(r["price"]), "seller_nick": r["seller_nick"] or "Аноним",
+             "seller_id": r["seller_id"], "created_at": str(r["created_at"])} for r in rows]
+
+@app.get("/admin/moderation/approve")
+async def admin_moderation_approve(uid: int = Query(...), product_id: int = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id FROM products WHERE id=$1 AND status='pending'", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        await d.execute("UPDATE products SET status='active' WHERE id=$1", product_id)
+    cache_del_prefix("products:")
+    asyncio.create_task(notify(row["seller_id"], f"✅ Ваш товар #{product_id} прошёл модерацию и теперь виден всем!"))
+    return {"ok": True}
+
+@app.get("/admin/moderation/reject")
+async def admin_moderation_reject(uid: int = Query(...), product_id: int = Query(...), reason: str = Query(default="Не соответствует правилам")):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id, is_premium FROM products WHERE id=$1 AND status='pending'", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["is_premium"]:
+            await db.change_balance(row["seller_id"], PREMIUM_PRICE)
+        await d.execute("UPDATE products SET status='deleted' WHERE id=$1", product_id)
+    asyncio.create_task(notify(row["seller_id"], f"❌ Ваш товар #{product_id} отклонён модератором. Причина: {reason}"))
+    return {"ok": True}
+
+@app.get("/admin/topup")
+async def admin_topup(uid: int = Query(...), to_uid: int = Query(...), amount: float = Query(...)):
+    if uid != ADMIN_ID: raise HTTPException(403, "Нет доступа")
+    if amount <= 0: raise HTTPException(400, "Сумма должна быть > 0")
+    await db.change_balance(to_uid, amount)
+    async with get_conn() as d:
+        await d.execute(
+            "INSERT INTO transactions (user_id,type,amount,description) VALUES ($1,$2,$3,$4)",
+            to_uid, "topup", amount, "Пополнение от администратора"
+        )
+    asyncio.create_task(notify(to_uid, f"💰 Администратор пополнил ваш баланс на {amount:.0f} ₽"))
     return {"ok": True}
 
 
@@ -272,16 +342,27 @@ async def get_product_delivery_files(product_id: int):
     return {"files": files}
 
 
-@app.get("/products/{category}")
-async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
-    if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
+@app.get("/products/relist")
+async def relist_product(
+    uid: int = Query(...), product_id: int = Query(...),
+    is_premium: bool = Query(default=False)
+):
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id, status FROM products WHERE id=$1", product_id)
+        if not row: raise HTTPException(404, "Товар не найден")
+        if row["status"] not in ("sold", "pending"):
+            raise HTTPException(400, f"Нельзя переопубликовать товар со статусом: {row['status']}")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+    if is_premium:
+        balance = await db.get_balance(uid)
+        if balance < PREMIUM_PRICE:
+            raise HTTPException(400, f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽)")
+        await db.change_balance(uid, -PREMIUM_PRICE)
+    async with get_conn() as d:
+        await d.execute("UPDATE products SET status='pending', is_premium=$1 WHERE id=$2", 1 if is_premium else 0, product_id)
+    cache_del_prefix("products:")
+    return {"ok": True}
 
-    # Кеш только для публичных листингов (без фильтра по продавцу)
-    cache_key = f"products:{category}:{sub.strip()}"
-    if not seller:
-        cached = cache_get(cache_key, ttl=60)
-        if cached is not None:
-            return cached
 
     async with get_conn() as d:
         q = """SELECT p.id, p.title, p.description, p.price, p.category,
@@ -294,8 +375,8 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
         params = [category]
         idx = 2
         if sub and sub.strip():
-            q += f" AND TRIM(p.subcategory)=${idx}"
-            params.append(sub.strip())
+            q += f" AND REPLACE(TRIM(p.subcategory), '\u00a0', ' ')=${idx}"
+            params.append(sub.strip().replace('\u00a0', ' '))
             idx += 1
         if seller:
             q += f" AND p.seller_id=${idx}"
@@ -392,9 +473,69 @@ async def get_product(product_id: int):
         "preview_url": p["preview_url"] or "",
         "seller_id": p["seller_id"], "seller_nick": nick_of(s),
         "seller_rating": round(avg, 1), "seller_reviews": cnt,
-        "seller_gets": round(p["price"] * (1 - SELL_COMM), 2)
+        "seller_gets": round(p["price"] * (1 - SELL_COMM), 2),
+        "status": p["status"]
     }
 
+@app.get("/products/{category}")
+async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
+    sub = sub.replace('\u00a0', ' ').strip()  # ← добавь эту строку
+    if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
+
+    cache_key = f"products:{category}:{sub.strip()}"
+    if not seller:
+        cached = cache_get(cache_key, ttl=60)
+        if cached is not None:
+            return cached
+
+    async with get_conn() as d:
+        q = """SELECT p.id, p.title, p.description, p.price, p.category,
+                      p.subcategory, p.media_id, p.media_type, p.preview_url,
+                      p.seller_id, p.is_premium,
+                      u.nickname as seller_nick
+               FROM products p
+               JOIN users u ON u.user_id = p.seller_id
+               WHERE p.category=$1 AND p.status='active'"""
+        params = [category]
+        idx = 2
+        if sub and sub.strip():
+            q += f" AND LOWER(TRIM(p.subcategory))=LOWER(${idx})"
+            params.append(sub.strip())
+            idx += 1
+        if seller:
+            q += f" AND p.seller_id=${idx}"
+            params.append(seller)
+        q += " ORDER BY COALESCE(p.is_premium,0) DESC, p.created_at DESC LIMIT 100"
+        rows = await d.fetch(q, *params)
+        if not rows:
+            return []
+        seller_ids = list({p["seller_id"] for p in rows})
+        ratings = await d.fetch(
+            "SELECT seller_id, ROUND(AVG(rating)::numeric,1) as avg FROM reviews WHERE seller_id=ANY($1) GROUP BY seller_id",
+            seller_ids
+        )
+        rating_map = {r["seller_id"]: float(r["avg"]) for r in ratings}
+
+    result = [{
+        "id":            p["id"],
+        "title":         p["title"],
+        "description":   p["description"],
+        "price":         round(float(p["price"]), 2),
+        "category":      p["category"],
+        "subcategory":   p["subcategory"] or "",
+        "media_id":      p["media_id"],
+        "media_type":    p["media_type"],
+        "preview_url":   p["preview_url"] or "",
+        "seller_id":     p["seller_id"],
+        "seller_nick":   p["seller_nick"] or "Аноним",
+        "seller_rating": rating_map.get(p["seller_id"], 0.0),
+        "is_premium":    bool(p["is_premium"]),
+        "seller_gets":   round(float(p["price"]) * (1 - SELL_COMM), 2)
+    } for p in rows]
+
+    if not seller:
+        cache_set(cache_key, result)
+    return result
 
 # ── ME ────────────────────────────────────────────────────
 @app.get("/me")
@@ -574,6 +715,10 @@ async def buy(product_id: int = Query(...), uid: int = Query(...)):
     await db.change_balance(uid, -p["price"])
     order_id = await db.create_order(uid, p["seller_id"], product_id, p["price"], commission, "")
     await db.update_order_status(order_id, "paid")
+    # Помечаем товар как проданный
+    async with get_conn() as d:
+        await d.execute("UPDATE products SET status='sold' WHERE id=$1", product_id)
+    cache_del_prefix("products:")
     order = await db.get_order(order_id)
     short = order["short_id"] or f"#{order_id}"
     seller_gets = round(p["price"] - commission, 2)
@@ -589,7 +734,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
     if not order or order["buyer_id"] != uid: raise HTTPException(403, "Нет доступа")
     if order["status"] not in ("paid", "seller_confirmed"): raise HTTPException(400, "Нельзя закрыть")
     seller_gets = round(order["amount"] - order["commission"], 2)
-    unfreeze_at = (datetime.now(MSK) + timedelta(days=2)).isoformat()
+    unfreeze_at = datetime.now(MSK) + timedelta(days=2)
     async with get_conn() as d:
         await d.execute(
             "INSERT INTO frozen_funds (user_id,order_id,amount,unfreeze_at) VALUES ($1,$2,$3,$4)",
@@ -597,7 +742,7 @@ async def confirm_order(order_id: int = Query(...), uid: int = Query(...)):
         )
     await db.update_order_status(order_id, "done")
     asyncio.create_task(notify(order["seller_id"],
-        f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at[:10]}"))
+        f"💰 Продажа завершена!\n{seller_gets} ₽ заморожены на 2 дня и поступят на баланс {unfreeze_at.strftime('%Y-%m-%d')}"))
     return {"ok": True}
 
 
@@ -823,12 +968,13 @@ async def support_tickets(uid: int = Query(...)):
 async def my_products(uid: int = Query(...)):
     async with get_conn() as d:
         rows = await d.fetch(
-            "SELECT * FROM products WHERE seller_id=$1 AND status='active' ORDER BY created_at DESC", uid
+            "SELECT * FROM products WHERE seller_id=$1 AND status IN ('active','sold','pending') ORDER BY created_at DESC", uid
         )
     return [{"id": p["id"], "title": p["title"], "price": p["price"],
          "category": p["category"], "subcategory": p["subcategory"] or "",
          "preview_url": p["preview_url"] or "",
-         "is_premium": bool(p["is_premium"])} for p in rows]
+         "is_premium": bool(p["is_premium"]),
+         "status": p["status"]} for p in rows]
 
 
 # ── FRIENDS ───────────────────────────────────────────────
