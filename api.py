@@ -219,6 +219,15 @@ async def delete_product(uid: int = Query(...), product_id: int = Query(...)):
     cache_del_prefix("products:")
     return {"ok": True}
 
+@app.get("/debug/subcats")
+async def debug_subcats(category: str = Query(...)):
+    async with get_conn() as d:
+        rows = await d.fetch(
+            "SELECT subcategory, COUNT(*) as cnt FROM products WHERE category=$1 AND status='active' GROUP BY subcategory",
+            category
+        )
+    return [{"sub": r["subcategory"], "repr": repr(r["subcategory"]), "cnt": r["cnt"]} for r in rows]
+
 @app.get("/products/update")
 async def update_product(
     uid: int = Query(...), product_id: int = Query(...),
