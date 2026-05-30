@@ -351,7 +351,7 @@ async def get_product_delivery_files(product_id: int, uid: int = Query(default=0
         # Проверяем — куплен ли товар этим пользователем, или он продавец
         is_seller = uid and row["seller_id"] == uid
         is_buyer = uid and await d.fetchrow(
-            "SELECT id FROM orders WHERE product_id=$1 AND buyer_id=$2 AND status IN ('paid','seller_confirmed','closed')",
+            "SELECT id FROM orders WHERE product_id=$1 AND buyer_id=$2 AND status IN ('paid','seller_confirmed','closed','done')",
             product_id, uid
         )
         if not is_seller and not is_buyer:
