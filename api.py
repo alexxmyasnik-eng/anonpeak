@@ -70,16 +70,9 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 
-ALLOWED_ORIGINS = [
-    "https://alexxmyasnik-eng.github.io",
-    "https://t.me",
-    "https://webk.telegram.org",
-    "https://webz.telegram.org",
-    "null",
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
     allow_credentials=False,
