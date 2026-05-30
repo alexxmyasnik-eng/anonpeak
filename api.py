@@ -73,6 +73,9 @@ app = FastAPI(lifespan=lifespan)
 ALLOWED_ORIGINS = [
     "https://alexxmyasnik-eng.github.io",
     "https://t.me",
+    "https://webk.telegram.org",
+    "https://webz.telegram.org",
+    "null",
 ]
 app.add_middleware(
     CORSMiddleware,
