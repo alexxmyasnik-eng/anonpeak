@@ -13,6 +13,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 import database as db
+print("API VERSION: 777")
 
 
 MSK = timezone(timedelta(hours=3))
