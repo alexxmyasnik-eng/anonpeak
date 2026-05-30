@@ -349,16 +349,27 @@ async def get_product_delivery_files(product_id: int):
     return {"files": files}
 
 
-@app.get("/products/{category}")
-async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
-    if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
+@app.get("/products/relist")
+async def relist_product(
+    uid: int = Query(...), product_id: int = Query(...),
+    is_premium: bool = Query(default=False)
+):
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT seller_id, status FROM products WHERE id=$1", product_id)
+        if not row: raise HTTPException(404, f"Товар не найден. product_id={product_id}, uid={uid}")
+        if row["status"] not in ("sold", "pending"):
+            raise HTTPException(400, f"Нельзя переопубликовать товар со статусом: {row['status']}")
+        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
+    if is_premium:
+        balance = await db.get_balance(uid)
+        if balance < PREMIUM_PRICE:
+            raise HTTPException(400, f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽)")
+        await db.change_balance(uid, -PREMIUM_PRICE)
+    async with get_conn() as d:
+        await d.execute("UPDATE products SET status='pending', is_premium=$1 WHERE id=$2", 1 if is_premium else 0, product_id)
+    cache_del_prefix("products:")
+    return {"ok": True}
 
-    # Кеш только для публичных листингов (без фильтра по продавцу)
-    cache_key = f"products:{category}:{sub.strip()}"
-    if not seller:
-        cached = cache_get(cache_key, ttl=60)
-        if cached is not None:
-            return cached
 
     async with get_conn() as d:
         q = """SELECT p.id, p.title, p.description, p.price, p.category,
@@ -473,26 +484,16 @@ async def get_product(product_id: int):
         "status": p["status"]
     }
 
-@app.get("/products/relist")
-async def relist_product(
-    uid: int = Query(...), product_id: int = Query(...),
-    is_premium: bool = Query(default=False)
-):
-    async with get_conn() as d:
-        row = await d.fetchrow("SELECT seller_id, status FROM products WHERE id=$1", product_id)
-        if not row: raise HTTPException(404, f"Товар не найден. product_id={product_id}, uid={uid}")
-        if row["status"] not in ("sold", "pending"):
-            raise HTTPException(400, f"Нельзя переопубликовать товар со статусом: {row['status']}")
-        if row["seller_id"] != uid: raise HTTPException(403, "Нет доступа")
-    if is_premium:
-        balance = await db.get_balance(uid)
-        if balance < PREMIUM_PRICE:
-            raise HTTPException(400, f"Недостаточно средств для премиум ({PREMIUM_PRICE} ₽)")
-        await db.change_balance(uid, -PREMIUM_PRICE)
-    async with get_conn() as d:
-        await d.execute("UPDATE products SET status='pending', is_premium=$1 WHERE id=$2", 1 if is_premium else 0, product_id)
-    cache_del_prefix("products:")
-    return {"ok": True}
+@app.get("/products/{category}")
+async def get_products(category: str, sub: str = Query(default=""), seller: int = Query(default=0)):
+    if category not in CATEGORIES: raise HTTPException(404, "Не найдено")
+
+    # Кеш только для публичных листингов (без фильтра по продавцу)
+    cache_key = f"products:{category}:{sub.strip()}"
+    if not seller:
+        cached = cache_get(cache_key, ttl=60)
+        if cached is not None:
+            return cached
 
 # ── ME ────────────────────────────────────────────────────
 @app.get("/me")
