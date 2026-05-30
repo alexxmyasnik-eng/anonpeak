@@ -767,7 +767,21 @@ async def buy(product_id: int = Query(...), uid: int = Query(...)):
     buyer = await db.get_user(uid)
     asyncio.create_task(notify(p["seller_id"],
         f"💰 <b>Новый заказ!</b>\nПокупатель: {nick_of(buyer)}\nТовар: {p['title']}\nВы получите: {seller_gets} ₽\nЗаказ: {short}"))
-    return {"ok": True, "short_id": short}
+    u1, u2 = min(uid, p["seller_id"]), max(uid, p["seller_id"])
+    async with get_conn() as d:
+        await d.execute(
+            "INSERT INTO conversations (user1_id, user2_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+            u1, u2
+        )
+        await d.execute(
+            "INSERT INTO dm_messages (from_id, to_id, message, order_id) VALUES ($1,$2,$3,$4)",
+            0, uid, f"🛒 Заказ {short} · {p['title']} · {p['price']} ₽ · Статус: Оплачен", order_id
+        )
+        await d.execute(
+            "INSERT INTO dm_messages (from_id, to_id, message, order_id) VALUES ($1,$2,$3,$4)",
+            0, p["seller_id"], f"🛒 Заказ {short} · {p['title']} · {seller_gets} ₽ · Статус: Оплачен", order_id
+        )
+    return {"ok": True, "short_id": short, "seller_id": p["seller_id"]}
 
 
 @app.get("/confirm_order")
@@ -1157,11 +1171,15 @@ async def dm_send(uid: int = Query(...), to_id: int = Query(...),
                   message: str = Query(...), reply_to_text: str = Query(default="")):
     if not message.strip(): raise HTTPException(400, "Пустое сообщение")
     async with get_conn() as d:
-        row = await d.fetchrow(
+        friend = await d.fetchrow(
             "SELECT status FROM friends WHERE user_id=$1 AND friend_id=$2", uid, to_id
         )
-        if not row or row["status"] != "accepted":
-            raise HTTPException(403, "Можно писать только друзьям")
+        u1, u2 = min(uid, to_id), max(uid, to_id)
+        conv = await d.fetchrow(
+            "SELECT id FROM conversations WHERE user1_id=$1 AND user2_id=$2", u1, u2
+        )
+        if (not friend or friend["status"] != "accepted") and not conv:
+            raise HTTPException(403, "Нельзя написать этому пользователю")
         await d.execute(
             "INSERT INTO dm_messages (from_id,to_id,message,reply_to_text) VALUES ($1,$2,$3,$4)",
             uid, to_id, message.strip(), reply_to_text.strip()
@@ -1243,32 +1261,40 @@ async def notifications(uid: int = Query(...)):
 async def dm_conversations(uid: int = Query(...)):
     async with get_conn() as d:
         rows = await d.fetch("""
-            SELECT DISTINCT ON (partner_id)
-                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END as partner_id,
-                m.message,
-                m.created_at,
-                m.is_read,
-                m.from_id,
+            SELECT
+                p.partner_id,
                 u.nickname,
                 u.avatar_url,
+                m.message as last_message,
+                m.created_at,
+                m.from_id,
                 (
                     SELECT COUNT(*) FROM dm_messages x
-                    WHERE x.to_id=$1 AND x.from_id=
-                        CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
-                    AND x.is_read=0
+                    WHERE x.to_id=$1 AND x.from_id=p.partner_id AND x.is_read=0
                 ) as unread_cnt
-            FROM dm_messages m
-            JOIN users u ON u.user_id =
-                CASE WHEN m.from_id=$1 THEN m.to_id ELSE m.from_id END
-            WHERE m.from_id=$1 OR m.to_id=$1
-            ORDER BY partner_id, m.created_at DESC
+            FROM (
+                SELECT CASE WHEN from_id=$1 THEN to_id ELSE from_id END as partner_id
+                FROM dm_messages WHERE (from_id=$1 OR to_id=$1) AND from_id != 0
+                UNION
+                SELECT CASE WHEN user1_id=$1 THEN user2_id ELSE user1_id END as partner_id
+                FROM conversations WHERE user1_id=$1 OR user2_id=$1
+            ) p
+            JOIN users u ON u.user_id = p.partner_id
+            LEFT JOIN LATERAL (
+                SELECT message, created_at, from_id FROM dm_messages
+                WHERE (from_id=$1 AND to_id=p.partner_id) OR (from_id=p.partner_id AND to_id=$1)
+                   OR (from_id=0 AND (to_id=$1 OR to_id=p.partner_id))
+                ORDER BY created_at DESC LIMIT 1
+            ) m ON true
+            GROUP BY p.partner_id, u.nickname, u.avatar_url, m.message, m.created_at, m.from_id
+            ORDER BY m.created_at DESC NULLS LAST
         """, uid)
     return [{
         "partner_id": r["partner_id"],
         "nickname":   r["nickname"] or "Аноним",
         "avatar_url": r["avatar_url"] or "",
-        "last_message": r["message"],
-        "created_at": str(r["created_at"]),
+        "last_message": r["last_message"] or "",
+        "created_at": str(r["created_at"] or ""),
         "unread": r["unread_cnt"],
         "is_out": r["from_id"] == uid
     } for r in rows]
