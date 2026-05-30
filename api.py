@@ -327,15 +327,44 @@ async def add_delivery_file(product_id: int, uid: int = Query(...), request: Req
 
 
 @app.get("/products/{product_id}/delivery_files")
-async def get_product_delivery_files(product_id: int):
+async def get_product_delivery_files(product_id: int, uid: int = Query(default=0)):
     async with get_conn() as d:
-        row = await d.fetchrow("SELECT delivery_files FROM products WHERE id=$1", product_id)
+        row = await d.fetchrow("SELECT delivery_files, seller_id FROM products WHERE id=$1", product_id)
         if not row: raise HTTPException(404, "Товар не найден")
+        # Проверяем — куплен ли товар этим пользователем, или он продавец
+        is_seller = uid and row["seller_id"] == uid
+        is_buyer = uid and await d.fetchrow(
+            "SELECT id FROM orders WHERE product_id=$1 AND buyer_id=$2 AND status IN ('paid','seller_confirmed','closed')",
+            product_id, uid
+        )
+        if not is_seller and not is_buyer:
+            raise HTTPException(403, "Купи товар чтобы получить доступ")
         try:
             files = json.loads(row["delivery_files"] or "[]")
         except:
             files = []
     return {"files": files}
+
+@app.get("/products/{product_id}/file/{file_index}")
+async def get_delivery_file(product_id: int, file_index: int, uid: int = Query(default=0)):
+    async with get_conn() as d:
+        row = await d.fetchrow("SELECT delivery_files, seller_id FROM products WHERE id=$1", product_id)
+        if not row: raise HTTPException(404)
+        is_seller = uid and row["seller_id"] == uid
+        is_buyer = uid and await d.fetchrow(
+            "SELECT id FROM orders WHERE product_id=$1 AND buyer_id=$2 AND status IN ('paid','seller_confirmed','closed')",
+            product_id, uid
+        )
+        if not is_seller and not is_buyer:
+            raise HTTPException(403, "Нет доступа")
+        files = json.loads(row["delivery_files"] or "[]")
+        if file_index >= len(files): raise HTTPException(404)
+        file_id = files[file_index]
+    async with aiohttp.ClientSession() as s:
+        resp = await s.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+        data = await resp.json()
+    if not data.get("ok"): raise HTTPException(404)
+    return RedirectResponse(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}")
 
 
 @app.get("/products/relist")
