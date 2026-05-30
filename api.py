@@ -498,8 +498,8 @@ async def get_products(category: str, sub: str = Query(default=""), seller: int 
         params = [category]
         idx = 2
         if sub and sub.strip():
-            q += f" AND LOWER(TRIM(p.subcategory))=LOWER(${idx})"
-            params.append(sub.strip())
+            q += f" AND LOWER(REPLACE(TRIM(p.subcategory), '\u00a0', ' '))=LOWER(${idx})"
+params.append(sub.strip().replace('\u00a0', ' '))
             idx += 1
         if seller:
             q += f" AND p.seller_id=${idx}"
